@@ -1,0 +1,156 @@
+#!/bin/bash
+# omarchy-patch-idle-blank — local patch to the Omarchy lock service.
+#
+# Two things Omarchy hardcodes and this machine wants configurable/working:
+#
+# 1. Omarchy blanks the display 5 seconds after the lock screen appears
+#    (idleBlankTimer.idleMs = 5000). After this patch it reads `idle.blank`
+#    from ~/.config/omarchy/shell.json, in seconds.
+# 2. Omarchy blanks by calling `omarchy-brightness-display off`, which is a
+#    DPMS dispatch that does nothing on Hyprland 0.56 (dpmsStatus never
+#    changes), so the panels stayed lit. After this patch blank/wake go
+#    through ~/.local/bin/screen-power, which drives DDC brightness.
+#
+#   omarchy-patch-idle-blank --check   # 0 patched, 1 safe to apply, 2 review
+#   omarchy-patch-idle-blank           # apply (idempotent, sudo once)
+#
+# `omarchy update` replaces /usr/share/omarchy, so the post-update hook
+# ~/.config/omarchy/hooks/post-update.d/90-idle-blank-patch re-applies this.
+
+set -euo pipefail
+
+TARGET=/usr/share/omarchy/shell/plugins/lock/Service.qml
+MARK="local patch: idle.blank"
+MARK2="local patch: real panel-off"
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+
+[[ -f $TARGET ]] || { echo "omarchy-patch-idle-blank: $TARGET not found" >&2; exit 2; }
+
+have_delay=0
+have_power=0
+grep -q "$MARK" "$TARGET" && have_delay=1
+grep -q "$MARK2" "$TARGET" && have_power=1
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --check)
+    if (( have_delay && have_power )); then
+      echo "patched: idle.blank honoured, screens blank through screen-power"
+      exit 0
+    fi
+    if (( have_delay )) || (( have_power )); then
+      echo "partially patched (delay=$have_delay screen-power=$have_power) - safe to re-apply"
+      exit 1
+    fi
+    if grep -q 'readonly property int idleMs: 5000' "$TARGET" \
+       && grep -q 'omarchy-brightness-keyboard off; omarchy-brightness-display off' "$TARGET"; then
+      echo "not patched (stock) - safe to apply"
+      exit 1
+    fi
+    echo "not patched and this file no longer looks stock - review $TARGET" >&2
+    exit 2
+    ;;
+  "" ) ;;
+  * ) usage >&2; exit 1 ;;
+esac
+
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+cp "$TARGET" "$TMP"          # user-owned copy: no sudo needed to edit
+
+if ! grep -q 'idleBlankTimer' "$TMP" || ! grep -q 'id: blankProcess' "$TMP"; then
+  echo "omarchy-patch-idle-blank: the lock service changed shape, not patching" >&2
+  exit 2
+fi
+
+python3 - "$TMP" <<'PY'
+import sys
+
+p = sys.argv[1]
+s = open(p).read()
+
+
+def once(old, new, what):
+    global s
+    if new.strip().splitlines()[0] in s and old not in s:
+        return
+    if old not in s:
+        if new in s:
+            return
+        raise SystemExit(f"anchor not found: {what}")
+    s = s.replace(old, new, 1)
+
+
+# 1. read idle.blank the way the idle service reads its own timeouts
+once(
+    "  property var shell: null\n",
+    "  property var shell: null\n"
+    "\n"
+    "  // local patch: idle.blank (seconds) from ~/.config/omarchy/shell.json.\n"
+    "  // How long the lock screen stays lit before the panels are turned off;\n"
+    "  // 0 keeps them lit until the machine is unlocked.\n"
+    "  readonly property var idleConfig: shell && shell.shellConfig && shell.shellConfig.idle\n"
+    "    ? shell.shellConfig.idle : ({})\n"
+    "  readonly property int defaultBlankSeconds: 5\n"
+    "  function blankSecondsFromConfig() {\n"
+    "    var n = Number(root.idleConfig && root.idleConfig.blank)\n"
+    "    if (!isFinite(n) || n < 0) return root.defaultBlankSeconds\n"
+    "    return Math.floor(n)\n"
+    "  }\n"
+    "  readonly property int blankTimeoutSeconds: blankSecondsFromConfig()\n",
+    "shell property",
+)
+
+# 2. the blank timer uses the setting (and never arms at 0)
+once(
+    "    readonly property int idleMs: 5000\n",
+    "    // local patch: idle.blank (seconds), 0 = never blank while locked\n"
+    "    readonly property int idleMs: root.blankTimeoutSeconds * 1000\n",
+    "idleMs constant",
+)
+
+once(
+    "  function armBlankTimer(delayMs) {\n"
+    "    idleBlankTimer.interval = delayMs || idleBlankTimer.idleMs\n",
+    "  function armBlankTimer(delayMs) {\n"
+    "    // local patch: idle.blank = 0 means the lock screen never blanks\n"
+    "    if (!delayMs && root.blankTimeoutSeconds <= 0) {\n"
+    "      idleBlankTimer.stop()\n"
+    "      return\n"
+    "    }\n"
+    "    idleBlankTimer.interval = delayMs || idleBlankTimer.idleMs\n",
+    "armBlankTimer",
+)
+
+# 3. report it in `omarchy-shell lock status`
+once(
+    "        locked: root.currentlyLocked(),\n",
+    "        locked: root.currentlyLocked(),\n        blank: root.blankTimeoutSeconds,\n",
+    "statusJson",
+)
+
+# 4. blank and wake through screen-power, because Hyprland 0.56 accepts
+#    hl.dsp.dpms({action="disable"}) and does nothing with it
+once(
+    'command: ["bash", "-c", "omarchy-brightness-keyboard off; omarchy-brightness-display off"]',
+    'command: ["bash", "-c", "screen-power off"]  // local patch: real panel-off',
+    "blankProcess",
+)
+
+once(
+    'command: ["bash", "-c", "omarchy-system-wake"]',
+    'command: ["bash", "-c", "omarchy-system-wake; screen-power on"]  // local patch',
+    "wakeProcess",
+)
+
+open(p, "w").write(s)
+print("patched")
+PY
+
+sudo install -m 644 "$TMP" "$TARGET"
+echo "patched $TARGET"
+echo "  idle.blank (seconds)  -> ~/.config/omarchy/shell.json"
+echo "  blank / wake          -> ~/.local/bin/screen-power"
+echo "the running shell picks up shell.json on its own; QML changes need"
+echo "  omarchy restart shell"

@@ -1,0 +1,970 @@
+#!/usr/bin/env python3
+"""desk — a pick-and-place Omarchy desktop kit.
+
+Pull this repo, run `./desk`, and choose what you want: a system monitor app, a
+desk that survives a reboot, per-monitor windows that stay put, themes, terminal
+and editor configs, the web-app launchers, the packages. Every piece is
+independent: grab the ones you want, leave the rest.
+
+    ./desk                      interactive picker
+    ./desk list                 what is in the kit and whether it is installed
+    ./desk install window-pin   install one thing, no questions
+    ./desk install all --yes    install everything
+    ./desk install all --dry-run
+    ./desk agent                print the prompt to hand an AI agent instead
+
+Everything is copied into your home directory, and anything it replaces is moved
+to ~/.local/state/desk/backup-<timestamp>/ first. Nothing outside ~ is touched
+unless you pick a component marked "sudo".
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+HOME = Path(os.environ.get("HOME") or Path.home())
+STATE = Path(os.environ.get("XDG_STATE_HOME") or (HOME / ".local/state")) / "desk"
+STAMP = time.strftime("%Y%m%d-%H%M%S")
+BACKUP = STATE / f"backup-{STAMP}"
+DRY = False
+
+BOLD, DIM, GREEN, YELLOW, RED, RESET = "", "", "", "", "", ""
+if sys.stdout.isatty():
+    BOLD, DIM, GREEN, YELLOW, RED, RESET = (
+        "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[0m",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+
+
+def say(message=""):
+    print(message)
+
+
+def step(message):
+    say(f"\n{BOLD}== {message}{RESET}")
+
+
+def info(message):
+    say(f"  {message}")
+
+
+def warn(message):
+    say(f"  {YELLOW}!{RESET} {message}")
+
+
+def fail(message):
+    say(f"  {RED}✗{RESET} {message}")
+
+
+def ok(message):
+    say(f"  {GREEN}✓{RESET} {message}")
+
+
+def run(argv, cwd=None, quiet=False, check=True, sudo=False):
+    if sudo:
+        argv = ["sudo", *argv]
+    if DRY:
+        info(f"would: {' '.join(str(a) for a in argv)}")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    result = subprocess.run(
+        [str(a) for a in argv],
+        cwd=cwd,
+        text=True,
+        capture_output=quiet,
+    )
+    if check and result.returncode != 0:
+        if quiet and result.stderr:
+            say(result.stderr.strip())
+        raise SystemExit(f"command failed ({result.returncode}): {' '.join(str(a) for a in argv)}")
+    return result
+
+
+def have(command):
+    return shutil.which(command) is not None
+
+
+def live():
+    """Are we operating on the session we are running in?
+
+    Compared against the passwd home, not $HOME: a sandbox run with
+    HOME=/tmp/somewhere still resolves Path.home() to that same directory.
+    """
+    try:
+        return HOME == Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, AttributeError):
+        return False
+
+
+def session_reload_hyprland():
+    if have("hyprctl") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and live():
+        run(["hyprctl", "reload"], quiet=True, check=False)
+    elif not live():
+        info("not the running session: skipped hyprctl reload")
+
+
+# --------------------------------------------------------------------------- #
+# component sources
+
+def sources(glob_list):
+    """Repo-relative paths for a component's globs."""
+    found = []
+    for pattern in glob_list:
+        matches = sorted(REPO.glob(pattern))
+        if not matches:
+            raise SystemExit(f"{pattern}: nothing in the repo matches this")
+        found.extend(matches)
+    return found
+
+
+def files_of(paths):
+    out = {}
+    for path in paths:
+        if path.is_dir():
+            for child in sorted(path.rglob("*")):
+                if child.is_file() or child.is_symlink():
+                    out[child] = True
+        else:
+            out[path] = True
+    return sorted(out)
+
+
+def destination(repo_path):
+    rel = repo_path.relative_to(REPO)
+    parts = rel.parts
+    if parts[0] == "home":
+        return HOME.joinpath(*parts[1:])
+    if parts[0] == "system":
+        return Path("/").joinpath(*parts[1:])
+    raise SystemExit(f"{rel}: not under home/ or system/")
+
+
+def same(source, target):
+    try:
+        if source.is_symlink() or target.is_symlink():
+            return source.is_symlink() and target.is_symlink() and os.readlink(source) == os.readlink(target)
+        if target.stat().st_size != source.stat().st_size:
+            return False
+        return source.read_bytes() == target.read_bytes()
+    except OSError:
+        return False
+
+
+def backup(target):
+    root = HOME if target.is_relative_to(HOME) else Path("/")
+    rel = target.relative_to(root)
+    saved = BACKUP / rel
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    if DRY:
+        info(f"would back up {target}")
+        return
+    shutil.move(str(target), str(saved))
+
+
+def place(source, target):
+    """Copy one file, keeping symlinks and permissions."""
+    if target.is_symlink() or target.exists():
+        backup(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if DRY:
+        info(f"would install {target}")
+        return
+    if source.is_symlink():
+        target.symlink_to(os.readlink(source))
+    else:
+        shutil.copy2(source, target)
+
+
+def install_files(component):
+    """Copy a component's files into place. Returns (installed, skipped)."""
+    changed = 0
+    kept = 0
+    for repo_path in files_of(sources(component["paths"])):
+        target = destination(repo_path)
+        if same(repo_path, target):
+            kept += 1
+            continue
+        if target.exists() and target.parts[1] == "etc":
+            # /etc needs root; copy the old file aside with sudo too
+            run(["install", "-Dm644", str(target), str(BACKUP / "system" / str(target.relative_to("/")))], sudo=True, check=False)
+            run(["install", "-Dm644", str(repo_path), str(target)], sudo=True)
+        else:
+            place(repo_path, target)
+        changed += 1
+    return changed, kept
+
+
+def status_of(component):
+    if component.get("status"):
+        return component["status"]()
+
+    total = 0
+    matching = 0
+    for repo_path in files_of(sources(component["paths"])):
+        target = destination(repo_path)
+        total += 1
+        if same(repo_path, target):
+            matching += 1
+
+    if matching == total and total:
+        return "installed"
+    if matching:
+        return "partial"
+    return "missing"
+
+
+# --------------------------------------------------------------------------- #
+# post-install actions
+
+
+def box(component, body):
+    """Edit a text file in place, only when needed, with a backup."""
+    path = HOME / component
+    if not path.exists():
+        warn(f"{path} does not exist, skipping")
+        return
+    text = path.read_text()
+    if body in text:
+        return
+    if not DRY:
+        backup(path)
+        path.write_text(text.rstrip("\n") + "\n" + body.lstrip("\n"))
+    info(f"added to {path}")
+
+
+def post_deskstate(component):
+    for name in ("deskstate", "deskstate-preview", "deskstate-restore-window"):
+        path = HOME / ".local/bin" / name
+        if path.exists() and not DRY:
+            path.chmod(0o755)
+
+    hook = HOME / ".config/omarchy/hooks/post-boot.d/deskstate-restore"
+    if hook.exists() and not DRY:
+        hook.chmod(0o755)
+
+    box(
+        ".config/hypr/bindings.lua",
+        '-- Rebuild the desktop recorded by deskstate.\n'
+        'o.bind("SUPER + SHIFT + R", "Restore desktop session", "kitty --title deskstate -e deskstate-restore-window")\n',
+    )
+
+    if not live():
+        info("not the running session: skipped systemctl --user")
+        return
+
+    if have("systemctl"):
+        run(["systemctl", "--user", "daemon-reload"], quiet=True, check=False)
+        run(
+            ["systemctl", "--user", "enable", "--now",
+             "deskstate-snapshot.timer", "deskstate-shutdown.service", "deskstate-watch.service"],
+            quiet=True, check=False,
+        )
+        ok("snapshot timer, shutdown snapshot and the reconcile watcher are enabled")
+
+
+def post_window_pin(component):
+    box(
+        ".config/hypr/hyprland.lua",
+        '-- Keep windows on the workspace and monitor they were on across a display\n'
+        '-- coming or going. See window-pin.lua.\n'
+        'require("hypr.window-pin")\n',
+    )
+    session_reload_hyprland()
+
+
+def post_hyprland(component):
+    if not live():
+        info("not the running session: skipped the Hyprland reload")
+        return
+    if not have("hyprctl"):
+        warn("hyprctl not found: is this an Omarchy/Hyprland machine?")
+        return
+    errors = run(["hyprctl", "configerrors"], quiet=True, check=False).stdout.strip()
+    if errors and not DRY:
+        fail(f"Hyprland config errors:\n{errors}")
+    else:
+        ok("Hyprland config loads clean")
+    session_reload_hyprland()
+    info("monitors: this kit sets none. Arrange them once with the Displays app")
+    info("          (SUPER + SPACE -> Setup -> Displays), or run ./desk run displays")
+
+
+def install_displays(component):
+    if have("nwg-displays"):
+        info("nwg-displays is already installed")
+    else:
+        warn("installing nwg-displays (sudo)")
+        if have("yay"):
+            run(["yay", "-S", "--needed", "nwg-displays"])
+        else:
+            run(["pacman", "-S", "--needed", "nwg-displays"], sudo=True)
+        ok("nwg-displays installed: SUPER + SPACE -> Setup -> Displays")
+
+
+def status_displays():
+    if not have("nwg-displays"):
+        return "missing"
+    layout = HOME / ".config/hypr/monitors.lua"
+    return "installed" if layout.exists() else "set up"
+
+
+def post_themes(component):
+    if not live():
+        info("not the running session: copied the themes and the recorded look only")
+        return
+    state = REPO / "state/omarchy"
+    theme = (state / "theme.name").read_text().strip() if (state / "theme.name").exists() else ""
+    background = (state / "background").read_text().strip() if (state / "background").exists() else ""
+    font = (state / "font").read_text().strip() if (state / "font").exists() else ""
+
+    if theme and have("omarchy"):
+        run(["omarchy", "theme", "set", theme], quiet=True, check=False)
+        info(f"theme      {theme}")
+    if theme and background:
+        background_file = HOME / f".local/state/omarchy/current/theme/backgrounds/{background}"
+        if background_file.exists():
+            run(["omarchy", "theme", "bg", "set", str(background_file)], quiet=True, check=False)
+            info(f"background {background}")
+        else:
+            warn(f"background {background} not found for theme {theme}")
+    if font and have("omarchy"):
+        current = run(["omarchy", "font", "current"], quiet=True, check=False).stdout.strip()
+        if current != font:
+            run(["omarchy", "font", "set", font], quiet=True, check=False)
+            info(f"font       {font} (was '{current or 'unknown'}')")
+
+
+def post_shell(component):
+    if not live():
+        info("not the running session: skipped the shell restart")
+        return
+    if have("omarchy"):
+        run(["omarchy", "restart", "shell"], quiet=True, check=False)
+        ok("Omarchy shell restarted")
+
+
+def post_idle(component):
+    for name in ("idle-settings", "omarchy-patch-idle-blank", "screen-power"):
+        path = HOME / ".local/bin" / name
+        if path.exists() and not DRY:
+            path.chmod(0o755)
+    hook = HOME / ".config/omarchy/hooks/post-update.d/90-idle-blank-patch"
+    if hook.exists() and not DRY:
+        hook.chmod(0o755)
+
+    patch = HOME / ".local/bin/omarchy-patch-idle-blank"
+    if patch.exists() and not DRY and live():
+        if run([str(patch), "--check"], quiet=True, check=False).returncode != 0:
+            run([str(patch)], quiet=True, check=False)
+            run(["omarchy", "restart", "shell"], quiet=True, check=False)
+            ok("lock screen blank delay patched")
+        else:
+            info("lock screen patch already applied")
+    warn("the machine-idle drop-in under /etc lands with sudo on the next component run")
+
+
+def post_misc(component):
+    """Regenerate the files that had this machine's home directory baked in."""
+    bookmarks = HOME / ".config/gtk-3.0/bookmarks"
+    lines = [
+        f"file://{HOME}/Downloads Downloads",
+        f"file://{HOME}/Documents Documents",
+        f"file://{HOME}/Projects Projects",
+        f"file://{HOME}/Pictures Pictures",
+        f"file://{HOME}/Videos Videos",
+    ]
+    if DRY:
+        info(f"would write {bookmarks}")
+    else:
+        bookmarks.parent.mkdir(parents=True, exist_ok=True)
+        bookmarks.write_text("\n".join(lines) + "\n")
+        info(f"wrote {bookmarks}")
+
+    gitconfig = HOME / ".config/git/config"
+    if gitconfig.exists():
+        text = gitconfig.read_text()
+        if "[user]" not in text:
+            warn("git identity not set: git config --global user.name \"Your Name\"")
+            warn("                          git config --global user.email you@example.com")
+
+
+# --------------------------------------------------------------------------- #
+# components with their own installer
+
+
+def install_vitals(component):
+    source = REPO / "apps/vitals"
+    deps = ["qmake6", "make", "g++"]
+    missing = [d for d in deps if not have(d)]
+    if missing:
+        raise SystemExit(
+            "vitals needs " + ", ".join(missing) + "\n"
+            "  sudo pacman -S --needed base-devel qt6-base qt6-declarative qt6-wayland"
+        )
+
+    if DRY:
+        info("would build apps/vitals with qmake6 + make and install into ~/.local")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="vitals-") as build:
+        run(["qmake6", str(source / "vitals.pro")], cwd=build, quiet=True)
+        run(["make", "-j", str(os.cpu_count() or 2)], cwd=build, quiet=True)
+        binary = Path(build) / "vitals"
+        if not binary.exists():
+            raise SystemExit("the build finished without a vitals binary")
+
+        targets = {
+            binary: HOME / ".local/bin/vitals",
+            source / "pkgbuild/vitals.desktop": HOME / ".local/share/applications/vitals.desktop",
+            source / "pkgbuild/vitals.svg": HOME / ".local/share/icons/hicolor/scalable/apps/vitals.svg",
+        }
+        for src, target in targets.items():
+            place(src, target)
+            if not DRY:
+                target.chmod(0o755 if target.name == "vitals" else 0o644)
+
+    if not DRY and have("update-desktop-database"):
+        run(["update-desktop-database", str(HOME / ".local/share/applications")], quiet=True, check=False)
+    ok("vitals installed in ~/.local/bin (in the menu as System Monitor)")
+
+
+def status_vitals():
+    if (HOME / ".local/bin/vitals").exists():
+        return "installed"
+    return "system" if have("vitals") else "missing"
+
+
+def install_packages(component):
+    extras = [line.strip() for line in (REPO / "packages/extras.txt").read_text().splitlines()]
+    extras = [line for line in extras if line and not line.startswith("#")]
+    if not extras:
+        return
+    warn(f"{len(extras)} packages: this needs sudo and the network")
+    if have("yay"):
+        run(["yay", "-S", "--needed", *extras])
+    else:
+        run(["pacman", "-S", "--needed", *extras], sudo=True)
+    ok("packages installed")
+
+
+def status_packages():
+    extras = [
+        line.strip()
+        for line in (REPO / "packages/extras.txt").read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not have("pacman"):
+        return "missing"
+    installed = set(
+        run(["pacman", "-Qq"], quiet=True, check=False).stdout.split()
+    )
+    return "installed" if all(name in installed for name in extras) else "missing"
+
+
+def show_agent(component):
+    prompt = REPO / "ai/RESTORE_PROMPT.md"
+    say(prompt.read_text())
+    say(f"\n{DIM}Hand that to an agent, or run ./desk for the picker.{RESET}")
+
+
+# --------------------------------------------------------------------------- #
+# the kit
+
+COMPONENTS = [
+    {
+        "id": "vitals",
+        "title": "vitals",
+        "summary": "system monitor app (CPU, GPU, memory, disks, network, processes)",
+        "paths": ["apps/vitals/**"],
+        "installer": install_vitals,
+        "status": status_vitals,
+        "run": "vitals",
+    },
+    {
+        "id": "deskstate",
+        "title": "deskstate",
+        "summary": "snapshot the desktop every minute and rebuild it after a reboot",
+        "paths": [
+            "home/.local/bin/deskstate",
+            "home/.local/bin/deskstate-preview",
+            "home/.local/bin/deskstate-restore-window",
+            "home/.config/deskstate/**",
+            "home/.config/systemd/user/deskstate-*",
+            "home/.config/omarchy/hooks/post-boot.d/deskstate-restore",
+        ],
+        "post": post_deskstate,
+    },
+    {
+        "id": "window-pin",
+        "title": "window-pin",
+        "summary": "windows stay on their workspace and monitor when a display blinks",
+        "paths": ["home/.config/hypr/window-pin.lua"],
+        "post": post_window_pin,
+    },
+    {
+        "id": "hyprland",
+        "title": "hyprland",
+        "summary": "keybindings, gaps, input, autostart, window opacity (no monitor layout)",
+        "paths": [
+            "home/.config/hypr/hyprland.lua",
+            "home/.config/hypr/workspaces.conf",
+            "home/.config/hypr/input.lua",
+            "home/.config/hypr/bindings.lua",
+            "home/.config/hypr/looknfeel.lua",
+            "home/.config/hypr/autostart.lua",
+            "home/.config/hypr/hyprsunset.conf",
+            "home/.config/hypr/xdph.conf",
+            "home/.config/hypr/.luarc.json",
+            "home/.local/state/omarchy/toggles/hypr/*.lua",
+        ],
+        "post": post_hyprland,
+        "replaces": "your current Hyprland config (backed up first)",
+    },
+    {
+        "id": "displays",
+        "title": "displays",
+        "summary": "the Displays app (nwg-displays) that owns this machine's monitor layout",
+        "paths": ["home/.config/nwg-displays/config"],
+        "installer": install_displays,
+        "status": status_displays,
+        "run": "nwg-displays",
+        "sudo": True,
+    },
+    {
+        "id": "themes",
+        "title": "themes",
+        "summary": "two generated themes, their backgrounds, and the look it was set to",
+        "paths": ["home/.config/omarchy/themes/**"],
+        "post": post_themes,
+    },
+    {
+        "id": "shell",
+        "title": "shell",
+        "summary": "Omarchy bar/menu settings, branding, the menu rows (Displays, System Monitor)",
+        "paths": [
+            "home/.config/omarchy/shell.json",
+            "home/.config/omarchy/shell.toml",
+            "home/.config/omarchy/branding/**",
+            "home/.config/omarchy/extensions/**",
+            "home/.config/omarchy/defaults/**",
+            "home/.config/omarchy/hooks/theme-set.d/**",
+        ],
+        "post": post_shell,
+    },
+    {
+        "id": "terminals",
+        "title": "terminals",
+        "summary": "kitty, alacritty, foot, ghostty, imv and the default-terminal list",
+        "paths": [
+            "home/.config/kitty/**",
+            "home/.config/alacritty/**",
+            "home/.config/foot/**",
+            "home/.config/ghostty/**",
+            "home/.config/imv/**",
+            "home/.config/xdg-terminals.list",
+        ],
+    },
+    {
+        "id": "editor",
+        "title": "editor",
+        "summary": "Neovim (LazyVim) with the theme hot-reload plugin and pinned lockfile",
+        "paths": ["home/.config/nvim/**"],
+    },
+    {
+        "id": "web-apps",
+        "title": "web-apps",
+        "summary": "launchers for the PWAs: Basecamp, Discord, Google apps, HEY, WhatsApp, X, YouTube, Zoom",
+        "paths": ["home/.local/share/applications/*.desktop"],
+    },
+    {
+        "id": "idle-power",
+        "title": "idle-power",
+        "summary": "screensaver/lock/panel-off policy, the real panel-off patch, no idle sleep",
+        "paths": [
+            "home/.local/bin/idle-settings",
+            "home/.local/bin/omarchy-patch-idle-blank",
+            "home/.local/bin/screen-power",
+            "home/.config/omarchy/hooks/post-update.d/**",
+            "system/etc/systemd/logind.conf.d/**",
+        ],
+        "post": post_idle,
+        "sudo": True,
+    },
+    {
+        "id": "audio",
+        "title": "audio",
+        "summary": "wireplumber fixes: never suspend the KEF USB sink, bluetooth A2DP autoconnect",
+        "paths": ["home/.config/wireplumber/**"],
+    },
+    {
+        "id": "misc",
+        "title": "misc",
+        "summary": "shell rc, git/lazygit aliases, mimeapps, user dirs, XCompose, share picker, nwg-displays",
+        "paths": [
+            "home/.bashrc",
+            "home/.XCompose",
+            "home/.config/git/**",
+            "home/.config/lazygit/**",
+            "home/.config/mimeapps.list",
+            "home/.config/hyprland-mimeapps.list",
+            "home/.config/user-dirs.dirs",
+            "home/.config/xdg-desktop-portal/**",
+            "home/.config/hyprland-preview-share-picker/**",
+        ],
+        "post": post_misc,
+    },
+    {
+        "id": "ai-apps",
+        "title": "ai-apps",
+        "summary": "settings for pi, claude and opencode, plus the superwhisper dictation config",
+        "paths": [
+            "home/.pi/agent/**",
+            "home/.claude/themes/**",
+            "home/.config/opencode/**",
+            "home/.config/superwhisper/**",
+        ],
+    },
+    {
+        "id": "packages",
+        "title": "packages",
+        "summary": "the packages the configuration needs and stock Omarchy lacks (sudo)",
+        "paths": ["packages/extras.txt"],
+        "installer": install_packages,
+        "status": status_packages,
+        "sudo": True,
+    },
+    {
+        "id": "agent",
+        "title": "agent",
+        "summary": "print the restore prompt to hand an AI agent instead of this picker",
+        "paths": ["ai/RESTORE_PROMPT.md"],
+        "installer": show_agent,
+        "action": True,
+        "status": lambda: "ready",
+    },
+]
+
+BY_ID = {c["id"]: c for c in COMPONENTS}
+
+
+# --------------------------------------------------------------------------- #
+# commands
+
+
+def component_status(component):
+    try:
+        return status_of(component)
+    except SystemExit as error:
+        return f"error: {error}"
+
+
+def colour_status(state, width=0):
+    pad = " " * max(0, width - len(state))
+    if state == "installed":
+        return f"{GREEN}{state}{RESET}{pad}"
+    if state == "missing":
+        return f"{DIM}{state}{RESET}{pad}"
+    if state == "ready":
+        return f"{DIM}{state}{RESET}{pad}"
+    return f"{YELLOW}{state}{RESET}{pad}"
+
+
+def cmd_list(args):
+    width = max(len(c["id"]) for c in COMPONENTS) + 2
+    say(f"{BOLD}desk{RESET} — {len(COMPONENTS)} things to grab or leave\n")
+    for component in COMPONENTS:
+        state = component_status(component)
+        say(f"  {component['id']:<{width}}{colour_status(state, 10)} {component['summary']}")
+        if component.get("sudo"):
+            say(f"  {'':<{width}}{DIM}(uses sudo){RESET}")
+    say(f"\n  {DIM}./desk install <id …|all> [--dry-run]   ./desk agent{RESET}")
+    return 0
+
+
+def cmd_status(args):
+    for component in COMPONENTS:
+        say(f"{component['id']}\t{component_status(component)}")
+    return 0
+
+
+def parse_selection(text, components):
+    picked = []
+    for token in re.split(r"[,\s]+", text.strip()):
+        if not token:
+            continue
+        if token in ("a", "all", "*"):
+            return [c for c in components if not c.get("action")]
+        if token in ("n", "none"):
+            return []
+        if token in BY_ID:
+            picked.append(BY_ID[token])
+            continue
+        if re.fullmatch(r"\d+", token):
+            index = int(token) - 1
+            if 0 <= index < len(components):
+                picked.append(components[index])
+                continue
+        if match := re.fullmatch(r"(\d+)-(\d+)", token):
+            low, high = int(match.group(1)), int(match.group(2))
+            picked.extend(components[low - 1:high])
+            continue
+        warn(f"ignoring '{token}'")
+    seen = []
+    for component in picked:
+        if component not in seen:
+            seen.append(component)
+    return seen
+
+
+def install_one(component):
+    step(f"{component['title']} — {component['summary']}")
+
+    if component.get("sudo"):
+        warn("uses sudo")
+    if component.get("replaces"):
+        warn(f"replaces {component['replaces']}")
+    if DRY:
+        info("(dry run: nothing is written)")
+
+    if component.get("installer"):
+        component["installer"](component)
+        return True
+
+    changed, kept = install_files(component)
+    if changed == 0:
+        info(f"already up to date ({kept} files)")
+    else:
+        ok(f"{changed} files placed, {kept} already matched")
+
+    if component.get("post"):
+        component["post"](component)
+    return True
+
+
+def ask(prompt, default="n"):
+    """input() that fails safe when there is no terminal to ask."""
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        say("")
+        raise SystemExit("no terminal to ask on: pass --yes to install without questions")
+    if not answer:
+        answer = default
+    return answer.lower() in ("y", "yes")
+
+
+def cmd_install(args):
+    if not args.ids:
+        raise SystemExit("desk install <id …|all>   (run ./desk list to see the ids)")
+
+    if args.ids == ["all"]:
+        picked = [c for c in COMPONENTS if not c.get("action")]
+    else:
+        picked = []
+        for name in args.ids:
+            if name not in BY_ID:
+                raise SystemExit(f"unknown component '{name}' (run ./desk list)")
+            picked.append(BY_ID[name])
+
+    if not args.yes and not DRY:
+        say(f"{BOLD}About to install:{RESET} " + ", ".join(c["id"] for c in picked))
+        if any(c.get("sudo") for c in picked):
+            say(f"{YELLOW}some of these use sudo{RESET}")
+        if not ask("Go ahead? [Y/n] ", default="y"):
+            say("nothing done")
+            return 1
+
+    done = []
+    skipped = []
+    for component in picked:
+        try:
+            install_one(component)
+            done.append(component["id"])
+        except SystemExit as error:
+            fail(f"{component['id']}: {error}")
+            skipped.append(component["id"])
+        except Exception as error:  # noqa: BLE001 - report, keep going
+            fail(f"{component['id']}: {error}")
+            skipped.append(component["id"])
+
+    step("done")
+    if done:
+        ok(", ".join(done))
+    if skipped:
+        fail("not installed: " + ", ".join(skipped))
+    if BACKUP.exists() and not DRY:
+        info(f"replaced files are in {BACKUP}")
+    if not skipped:
+        info("next: ./desk list to see what else is missing")
+    return 0 if not skipped else 1
+
+
+def cmd_run(args):
+    name = args.id
+    if name not in BY_ID:
+        raise SystemExit(f"unknown component '{name}'")
+    command = BY_ID[name].get("run")
+    if not command:
+        raise SystemExit(f"{name} has nothing to run")
+    if not have(command):
+        raise SystemExit(f"{name} is not installed ({command} not on PATH)")
+    os.execvp(command, [command])
+
+
+def cmd_agent(args):
+    text = (REPO / "ai/RESTORE_PROMPT.md").read_text()
+    if args.copy and have("wl-copy"):
+        subprocess.run(["wl-copy"], input=text, text=True, check=False)
+        say(f"{GREEN}copied{RESET} the restore prompt to the clipboard")
+    else:
+        say(text)
+    return 0
+
+
+def interactive(args):
+    while True:
+        say(f"\n{BOLD}desk{RESET} — what should this machine have?{RESET}\n")
+        width = max(len(c["id"]) for c in COMPONENTS) + 1
+        for index, component in enumerate(COMPONENTS, 1):
+            state = component_status(component)
+            marker = "*" if component.get("sudo") else " "
+            say(f" {index:>2}{marker} {component['id']:<{width}} {colour_status(state, 10)} {component['summary']}")
+        say(f"\n  {DIM}* uses sudo · a = all · n = none · ?<num> = details · q = quit{RESET}")
+
+        try:
+            answer = input(f"{BOLD}Pick{RESET} [1-{len(COMPONENTS)}, a, n, q]: ").strip()
+        except EOFError:
+            say("")
+            return 0
+
+        if answer.lower() in ("q", "quit", "exit"):
+            return 0
+        if answer.startswith("?"):
+            detail = parse_selection(answer[1:], COMPONENTS)
+            if detail:
+                component = detail[0]
+                say(f"\n{BOLD}{component['title']}{RESET} — {component['summary']}")
+                say(f"  status: {component_status(component)}")
+                if component.get("replaces"):
+                    say(f"  replaces: {component['replaces']}")
+                say("  files:")
+                for repo_path in files_of(sources(component["paths"]))[:40]:
+                    try:
+                        say(f"    {repo_path.relative_to(REPO)} -> {destination(repo_path)}")
+                    except SystemExit:
+                        say(f"    {repo_path.relative_to(REPO)} (read from the repo)")
+                try:
+                    input(f"\n{DIM}enter to go back{RESET} ")
+                except EOFError:
+                    return 0
+            continue
+
+        picked = parse_selection(answer, COMPONENTS)
+        if not picked:
+            return 0
+
+        say(f"\n{BOLD}Selected:{RESET} " + ", ".join(c["id"] for c in picked))
+        if any(c.get("sudo") for c in picked):
+            say(f"{YELLOW}some of these use sudo{RESET}")
+        try:
+            go = input("Install? [Y/n] ").strip().lower()
+        except EOFError:
+            say("")
+            return 1
+        if go not in ("", "y", "yes"):
+            continue
+
+        for component in picked:
+            try:
+                install_one(component)
+            except SystemExit as error:
+                fail(f"{component['id']}: {error}")
+
+        if BACKUP.exists():
+            info(f"replaced files are in {BACKUP}")
+        try:
+            again = input("\nAnything else? [y/N] ").strip().lower()
+        except EOFError:
+            say("")
+            return 0
+        if again not in ("y", "yes"):
+            return 0
+
+
+def main(argv):
+    global DRY
+
+    parser = argparse.ArgumentParser(
+        prog="desk",
+        description="Pick and place an Omarchy desktop kit.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  ./desk                       interactive picker\n"
+            "  ./desk list                  what is here, and what is installed\n"
+            "  ./desk install window-pin    one thing\n"
+            "  ./desk install all --dry-run\n"
+            "  ./desk agent --copy          restore prompt for an AI agent\n"
+        ),
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("list", help="list the components and their state")
+
+    status_parser = sub.add_parser("status", help="machine-readable component state")
+    status_parser.add_argument("-j", "--json", action="store_true", help="as json")
+
+    install_parser = sub.add_parser("install", help="install components")
+    install_parser.add_argument("ids", nargs="*", help="component ids, or 'all'")
+    install_parser.add_argument("-y", "--yes", action="store_true", help="do not ask")
+    install_parser.add_argument("-n", "--dry-run", action="store_true", help="only say what would happen")
+
+    run_parser = sub.add_parser("run", help="run an installed component")
+    run_parser.add_argument("id")
+
+    agent_parser = sub.add_parser("agent", help="print the AI restore prompt")
+    agent_parser.add_argument("-c", "--copy", action="store_true", help="copy it to the clipboard")
+
+    args = parser.parse_args(argv)
+
+    if args.command is None:
+        return interactive(args)
+    if args.command == "list":
+        return cmd_list(args)
+    if args.command == "status":
+        states = {c["id"]: component_status(c) for c in COMPONENTS}
+        if args.json:
+            say(json.dumps(states, indent=2))
+        else:
+            for name, state in states.items():
+                say(f"{name}\t{state}")
+        return 0
+    if args.command == "install":
+        DRY = args.dry_run
+        return cmd_install(args)
+    if args.command == "run":
+        return cmd_run(args)
+    if args.command == "agent":
+        return cmd_agent(args)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        say("\naborted")
+        sys.exit(130)

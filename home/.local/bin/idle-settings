@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# idle-settings — set the screensaver, lock screen and blank timings.
+#
+#   idle-settings              interactive
+#   idle-settings --show       print the current values and exit
+#   idle-settings --set screensaver=120 lock=1200 blank=600
+#
+# Writes ~/.config/omarchy/shell.json (the running shell watches it, so the
+# change applies to the next idle cycle - no restart). Values are in seconds;
+# 0 disables that action. `blank` needs omarchy-patch-idle-blank; without it
+# the lock blanks 5 s after it appears and any value here is ignored.
+
+set -euo pipefail
+
+CONFIG="$HOME/.config/omarchy/shell.json"
+PATCHER="$HOME/.local/bin/omarchy-patch-idle-blank"
+
+show() {
+  python3 - "$CONFIG" <<'PY'
+import json, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    cfg = json.load(f)
+idle = cfg.get("idle") or {}
+
+
+def fmt(seconds):
+    if seconds is None:
+        return "not set (Omarchy default)"
+    if seconds == 0:
+        return "off"
+    m, s = divmod(int(seconds), 60)
+    if m and s:
+        return f"{seconds}s ({m}m {s}s)"
+    if m:
+        return f"{seconds}s ({m}m)"
+    return f"{seconds}s"
+
+
+print(f"  screensaver   {fmt(idle.get('screensaver'))}")
+print(f"  lock screen   {fmt(idle.get('lock'))}")
+print(f"  blank         {fmt(idle.get('blank'))}  after the lock screen appears")
+PY
+}
+
+patch_state() {
+  if [[ ! -x $PATCHER ]]; then
+    echo "  ! omarchy-patch-idle-blank is missing - 'blank' will be ignored"
+    return
+  fi
+  local out rc
+  out=$("$PATCHER" --check 2>&1) && rc=0 || rc=$?
+  case $rc in
+    0) ;;
+    1) echo "  ! $out  ->  run omarchy-patch-idle-blank" ;;
+    *) echo "  ! $out" ;;
+  esac
+}
+
+write_config() { # $1 = key, $2 = value
+  python3 - "$CONFIG" "$1" "$2" <<'PY'
+import json, sys
+
+path, key, value = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(path) as f:
+    cfg = json.load(f)
+idle = cfg.setdefault("idle", {})
+idle[key] = value
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2, sort_keys=True, ensure_ascii=False)
+    f.write("\n")
+PY
+}
+
+ask_seconds() { # $1 = label, $2 = current, $3 = default
+  local answer
+  answer=$(gum input --prompt "$1 (seconds, 0 = off) > " --value "${2:-$3}" --width 40) || return 1
+  [[ $answer =~ ^[0-9]+$ ]] || { echo "not a number: $answer" >&2; return 1; }
+  printf '%s' "$answer"
+}
+
+case "${1:-}" in
+  -h|--help)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  --show)
+    show
+    patch_state
+    exit 0
+    ;;
+  --set)
+    shift
+    for arg in "$@"; do
+      key=${arg%%=*}
+      value=${arg#*=}
+      case $key in
+        screensaver|lock|blank) ;;
+        *) echo "unknown key: $key (screensaver|lock|blank)" >&2; exit 1 ;;
+      esac
+      [[ $value =~ ^[0-9]+$ ]] || { echo "$key needs whole seconds" >&2; exit 1; }
+      write_config "$key" "$value"
+    done
+    show
+    patch_state
+    exit 0
+    ;;
+  "") ;;
+  *)
+    echo "unknown option: $1 (try --help)" >&2
+    exit 1
+    ;;
+esac
+
+current=$(python3 - "$CONFIG" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    idle = (json.load(f).get("idle") or {})
+print(idle.get("screensaver", ""), idle.get("lock", ""), idle.get("blank", ""))
+PY
+)
+read -r cur_saver cur_lock cur_blank <<<"$current"
+
+gum style --border normal --padding '0 2' --border-foreground 212 \
+  "Idle timings" "" \
+  "$(show)" ""
+patch_state
+echo
+
+new_saver=$(ask_seconds "Screensaver after" "$cur_saver" 150) || exit 0
+new_lock=$(ask_seconds "Lock screen after" "$cur_lock" 300) || exit 0
+new_blank=$(ask_seconds "Screen black after lock" "$cur_blank" 5) || exit 0
+
+write_config screensaver "$new_saver"
+write_config lock "$new_lock"
+write_config blank "$new_blank"
+
+echo
+show
+patch_state
+echo
+echo "Applied - the running shell watches this file, so the next idle cycle uses it."

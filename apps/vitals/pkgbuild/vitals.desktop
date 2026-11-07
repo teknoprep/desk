@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Name=Vitals
+GenericName=System Monitor
+Comment=Live reading of the machine: CPU, GPU, memory, disks, network, processes
+Comment[da]=Live aflæsning af maskinen: CPU, GPU, hukommelse, diske, netværk, processer
+Comment[de]=Live-Anzeige des Systems: CPU, GPU, Speicher, Datenträger, Netzwerk, Prozesse
+Comment[es]=Lectura en vivo del equipo: CPU, GPU, memoria, discos, red, procesos
+Comment[fr]=Lecture en direct de la machine : CPU, GPU, mémoire, disques, réseau, processus
+Comment[pt_BR]=Leitura ao vivo da máquina: CPU, GPU, memória, discos, rede, processos
+GenericName[da]=Systemovervågning
+GenericName[de]=Systemmonitor
+GenericName[es]=Monitor del sistema
+GenericName[fr]=Moniteur système
+GenericName[pt_BR]=Monitor do sistema
+Keywords=system monitor;monitor;activity;resources;performance;cpu;gpu;memory;ram;disk;network;processes;top;btop;
+Keywords[da]=systemovervågning;overvågning;aktivitet;ressourcer;ydelse;cpu;gpu;hukommelse;disk;netværk;processer;
+Keywords[de]=systemmonitor;überwachung;aktivität;ressourcen;leistung;cpu;gpu;speicher;festplatte;netzwerk;prozesse;
+Keywords[es]=monitor del sistema;monitor;actividad;recursos;rendimiento;cpu;gpu;memoria;disco;red;procesos;
+Keywords[fr]=moniteur système;moniteur;activité;ressources;performance;cpu;gpu;mémoire;disque;réseau;processus;
+Keywords[pt_BR]=monitor do sistema;monitor;atividade;recursos;desempenho;cpu;gpu;memória;disco;rede;processos;
+Exec=vitals %f
+Icon=vitals
+Terminal=false
+Categories=System;Monitor;
+StartupWMClass=vitals

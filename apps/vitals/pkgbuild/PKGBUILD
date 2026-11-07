@@ -1,0 +1,24 @@
+pkgname=vitals
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Live reading of the machine: CPU, GPU, memory, disks, network, processes'
+arch=('x86_64' 'aarch64')
+url='https://github.com/chris/vitals'
+license=('MIT')
+depends=('qt6-base' 'qt6-declarative' 'qt6-wayland')
+makedepends=('gcc' 'make')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  ./bin/build
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 build/vitals "$pkgdir/usr/bin/vitals"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$startdir/vitals.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/vitals.svg"
+  install -Dm644 "$startdir/vitals.desktop" "$pkgdir/usr/share/applications/vitals.desktop"
+}

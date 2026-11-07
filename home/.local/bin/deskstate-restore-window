@@ -1,0 +1,13 @@
+#!/bin/bash
+# Open a terminal window, restore the last deskstate snapshot inside it, and
+# wait for a keypress so the report stays readable.
+set -u
+
+deskstate restore "$@"
+status=$?
+echo
+if [[ $status -ne 0 ]]; then
+  echo "restore exited with status $status"
+fi
+read -rn 1 -s -p "press any key to close"
+echo

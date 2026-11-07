@@ -1,0 +1,27 @@
+#!/bin/bash
+# Re-apply the local lock-screen patch after `omarchy update`.
+#
+# omarchy owns /usr/share/omarchy, and an update replaces it wholesale, which
+# silently reverts two local changes:
+#   * the blank delay is read from shell.json idle.blank
+#   * blank/wake go through ~/.local/bin/screen-power instead of a DPMS
+#     dispatch that does nothing on this Hyprland build
+#
+# This hook puts them back. Safe to run any time (idempotent).
+
+PATCHER="$HOME/.local/bin/omarchy-patch-idle-blank"
+
+[[ -x $PATCHER ]] || exit 0
+
+if "$PATCHER" --check >/dev/null 2>&1; then
+  exit 0
+fi
+
+"$PATCHER" >>"$HOME/.local/state/omarchy/idle-blank-patch.log" 2>&1 || true
+if "$PATCHER" --check >/dev/null 2>&1; then
+  # the patched QML only takes effect in a fresh shell
+  omarchy restart shell >>"$HOME/.local/state/omarchy/idle-blank-patch.log" 2>&1 || true
+  omarchy-notification-send -g 🔒 "Lock screen timings restored after the update" || true
+else
+  omarchy-notification-send -g ⚠ "Lock-screen patch did not apply - see ~/.local/state/omarchy/idle-blank-patch.log" || true
+fi

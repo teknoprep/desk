@@ -1,0 +1,8 @@
+# Packages the configuration in this repo actually needs, which a stock
+# Omarchy install does not ship. Nothing else is tracked: installing or
+# removing applications is machine state, not setup.
+#
+#   omarchy pkg add nwg-displays gtk-layer-shell python-i3ipc
+nwg-displays          # Setup -> Displays in the menu; talks zwlr_output_manager_v1
+gtk-layer-shell       # dependency of nwg-displays
+python-i3ipc          # dependency of nwg-displays (workspace labels)

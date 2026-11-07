@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.bak.*
+
+# build output from `./desk install vitals`
+apps/vitals/build/
+apps/vitals/pkgbuild/pkg/
+apps/vitals/pkgbuild/*.pkg.tar.zst
+
+# what the installer writes, never the repo
+.local/state/

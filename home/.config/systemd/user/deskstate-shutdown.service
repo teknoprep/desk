@@ -1,0 +1,15 @@
+[Unit]
+Description=deskstate final snapshot before the session goes away
+# Started with the graphical session and, being ordered after it, stopped before
+# it: the snapshot runs while the compositor and its windows are still alive.
+# The old WantedBy=shutdown.target never fired in the user manager (0 starts).
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/deskstate snapshot --quiet
+RemainAfterExit=no
+
+[Install]
+WantedBy=graphical-session.target

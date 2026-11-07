@@ -1,0 +1,1591 @@
+#!/usr/bin/env python3
+"""deskstate - snapshot and restore the Omarchy/Hyprland desktop.
+
+Records what is on screen (windows, workspaces, monitors, geometry), every
+kitty window (tabs, cwd, foreground process, scrollback), the pi sessions
+running in those terminals, the tmux layout and panes, and the last command
+each terminal ran before an ssh session - so a reboot or a power cut can be
+picked up again where it left off.
+
+Commands:
+  deskstate snapshot           record the current state (the timer does this)
+  deskstate show [--json]      print the last snapshot
+  deskstate restore [opts]     rebuild the desktop from the last snapshot
+  deskstate reconcile [--apply] put windows back where the snapshot says
+  deskstate watch              listen for monitor/window events, reconcile
+  deskstate prune              drop old snapshots from the history
+
+Options for restore:
+  --dry-run          print the plan without starting anything
+  --reconnect-ssh    re-run ssh commands instead of leaving them for Up-arrow
+  --only all|kitty|apps|tmux
+
+State lives in ~/.local/state/deskstate/.
+"""
+
+import argparse
+import glob
+import gzip
+import json
+import os
+import re
+import shlex
+import shutil
+import urllib.request
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+UID = os.getuid()
+STATE = os.environ.get("DESKSTATE_STATE") or os.path.join(HOME, ".local", "state", "deskstate")
+LATEST = os.path.join(STATE, "latest.json")
+SCROLL = os.path.join(STATE, "scrollback")
+HISTORY = os.path.join(STATE, "history")
+RESTORE = os.path.join(STATE, "restore")
+PI_SESSIONS = os.path.join(HOME, ".pi", "agent", "sessions")
+EXTRACTORS = os.path.join(HOME, ".config", "deskstate", "extractors.d")
+EMPTY_STREAK = os.path.join(STATE, "empty-streak")
+EMPTY_STREAK_LIMIT = 3       # consecutive empty snapshots before believing it
+KEEP_SNAPSHOTS = 1440        # one day at one snapshot per minute
+SCROLL_LINES = 120
+MAX_TEXT = 200_000
+SHELLS = {"bash", "zsh", "sh", "fish", "dash", "-bash"}
+START_TOLERANCE = 10         # seconds between process start and session creation
+SLOTS = 10                   # workspaces per monitor, as Omarchy numbers them
+OMARCHY_WS_STATE = os.path.join(HOME, ".local", "state", "omarchy", "monitor-workspaces")
+RECONCILE_LOG = os.path.join(STATE, "reconcile.log")
+APPS_LOG = os.path.join(STATE, "restore-apps.log")
+
+
+# --------------------------------------------------------------------------
+# small process / shell helpers
+# --------------------------------------------------------------------------
+
+def run(cmd, timeout=8):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:  # noqa: BLE001 - a failed probe must not kill a snapshot
+        return 1, "", str(e)
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def link(path):
+    try:
+        return os.readlink(path)
+    except Exception:
+        return None
+
+
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip() or 0)
+    except Exception:
+        return 0
+
+
+def write_int(path, value):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(str(value))
+    except Exception:
+        pass
+
+
+def cmdline(pid):
+    try:
+        raw = open("/proc/%d/cmdline" % int(pid), "rb").read()
+        return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    except Exception:
+        return []
+
+
+_BTIME = [None]
+
+
+def btime():
+    if _BTIME[0] is None:
+        _BTIME[0] = 0
+        for line in read("/proc/stat").splitlines():
+            if line.startswith("btime "):
+                _BTIME[0] = int(line.split()[1])
+    return _BTIME[0]
+
+
+def proc_start(pid):
+    """Epoch seconds when the process started."""
+    try:
+        stat = read("/proc/%d/stat" % int(pid))
+        fields = stat[stat.rfind(")") + 2:].split()
+        return btime() + int(fields[19]) / float(os.sysconf("SC_CLK_TCK"))
+    except Exception:
+        return None
+
+
+def children(pid):
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        stat = read("/proc/%s/stat" % d)
+        if not stat:
+            continue
+        try:
+            rest = stat[stat.rfind(")") + 2:].split()
+            if int(rest[1]) == int(pid):
+                out.append(int(d))
+        except Exception:
+            continue
+    return out
+
+
+def hypr_json(*args):
+    rc, out, _ = run(["hyprctl", "-j"] + list(args))
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def hypr_eval(code):
+    return run(["hyprctl", "eval", code])
+
+
+def base(cmd):
+    return os.path.basename(cmd[0]) if cmd else ""
+
+
+BROWSER_HINTS = ("microsoft-edge", "msedge-", "google-chrome", "chromium",
+                 "brave", "vivaldi", "helium")
+
+
+def is_browser_class(cls):
+    c = (cls or "").lower()
+    return any(h in c for h in BROWSER_HINTS)
+
+
+# Chromium-family relaunch -------------------------------------------------
+#
+# Hyprland reports the browser's main process as the pid of every window it
+# owns (a Teams PWA window and two Edge windows all share one pid), and
+# Chromium rewrites that process's command line into a single space-joined
+# string. So the recorded cmdline cannot be replayed. What does identify a
+# window is its class:
+#
+#   microsoft-edge                    a normal browser window
+#   msedge-<appid>-<profile>          an installed web app (Teams, Outlook)
+#
+# Chromium web app ids are always 32 characters in the range a-p.
+
+PWA_CLASS = re.compile(r"^(?P<prefix>[A-Za-z0-9]+)-(?P<appid>[a-p]{32})-(?P<profile>.+)$")
+
+BROWSER_BINS = {
+    "edge": ["/opt/microsoft/msedge/msedge", "microsoft-edge-stable", "microsoft-edge"],
+    "chrome": ["google-chrome-stable", "google-chrome"],
+    "chromium": ["chromium"],
+    "brave": ["brave-browser", "brave"],
+    "vivaldi": ["vivaldi-stable", "vivaldi"],
+    "helium": ["helium"],
+}
+
+
+def browser_family(cls):
+    c = (cls or "").lower()
+    for family, marks in (("edge", ("microsoft-edge", "msedge")),
+                          ("chrome", ("google-chrome",)),
+                          ("chromium", ("chromium",)),
+                          ("brave", ("brave",)),
+                          ("vivaldi", ("vivaldi",)),
+                          ("helium", ("helium",))):
+        if any(m in c for m in marks):
+            return family
+    return ""
+
+
+def flatten(args):
+    """Chromium overwrites /proc/<pid>/cmdline with one space-joined string."""
+    args = list(args or [])
+    if len(args) == 1 and " " in args[0]:
+        try:
+            return shlex.split(args[0])
+        except ValueError:
+            return args[0].split()
+    return args
+
+
+_MAIN_CACHE = {}
+
+
+def browser_main(family):
+    """The argv of the running main process of this browser, if any."""
+    if family in _MAIN_CACHE:
+        return _MAIN_CACHE[family]
+    names = {os.path.basename(p) for p in BROWSER_BINS.get(family, [])}
+    found = None
+    if names:
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            argv = flatten(cmdline(int(d)))
+            if not argv or os.path.basename(argv[0]) not in names:
+                continue
+            if any(a.startswith("--type=") for a in argv[1:]):
+                continue
+            found = argv
+            break
+    _MAIN_CACHE[family] = found
+    return found
+
+
+def browser_launch(win):
+    """argv that reopens one Chromium-family window, or None."""
+    cls = win.get("class") or ""
+    family = browser_family(cls) or "edge"
+    main = browser_main(family)
+
+    argv0 = None
+    record = flatten(win.get("cmdline"))
+    if record and not any(a.startswith("--type=") for a in record[1:]) \
+            and record[0].startswith("/") and os.access(record[0], os.X_OK):
+        argv0 = record[0]
+    if not argv0 and main:
+        argv0 = main[0]
+    if not argv0:
+        for cand in BROWSER_BINS.get(family, []):
+            path = cand if os.path.isabs(cand) else shutil.which(cand)
+            if path and os.path.exists(path):
+                argv0 = path
+                break
+    if not argv0:
+        return None
+
+    app = PWA_CLASS.match(cls)
+    profile = app.group("profile") if app else None
+    if not profile and main:
+        profile = next((a.split("=", 1)[1] for a in main
+                         if a.startswith("--profile-directory=")), None)
+    argv = [argv0]
+    if profile:
+        argv.append("--profile-directory=%s" % profile)
+    if app:
+        argv.append("--app-id=%s" % app.group("appid"))
+    else:
+        argv.append("--new-window")
+    return argv
+
+
+def launch_argv(win):
+    """How to start this window again, or None when nothing usable was recorded."""
+    extras = win.get("extras") or {}
+    if extras.get("restore_cmd"):
+        return list(extras["restore_cmd"])
+    if is_browser_class(win.get("class")):
+        return browser_launch(win)
+    return list(win.get("cmdline") or []) or None
+
+
+# --------------------------------------------------------------------------
+# browser tabs (Chromium family, via the DevTools protocol)
+# --------------------------------------------------------------------------
+
+def cdp_port():
+    try:
+        return int(os.environ.get("DESKSTATE_CDP_PORT") or 9222)
+    except ValueError:
+        return 9222
+
+
+def browser_tabs():
+    """Every open Chromium tab, when the browser exposes DevTools.
+
+    Needs --remote-debugging-port=127.0.0.1:9222 in the browser's flags file;
+    returns None when the endpoint is not listening.
+    """
+    url = "http://127.0.0.1:%d/json/list" % cdp_port()
+    try:
+        with urllib.request.urlopen(url, timeout=1.5) as r:
+            data = json.load(r)
+    except Exception:
+        return None
+    tabs = []
+    for t in data:
+        if t.get("type") != "page":
+            continue
+        tabs.append({"title": t.get("title") or "", "url": t.get("url") or ""})
+    return tabs
+
+
+# --------------------------------------------------------------------------
+# per-app extractors (optional, user supplied)
+# --------------------------------------------------------------------------
+
+def run_extractors(win):
+    """Let ~/.config/deskstate/extractors.d/<app> add app-specific state.
+
+    Each executable gets the window record as JSON on stdin and may print JSON
+    with "restore_cmd" (argv list) and/or "restore_note" (string).
+    """
+    if not os.path.isdir(EXTRACTORS):
+        return None
+    payload = json.dumps(win)
+    merged = {}
+    for path in sorted(glob.glob(os.path.join(EXTRACTORS, "*"))):
+        if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+            continue
+        try:
+            proc = subprocess.run([path], input=payload, capture_output=True,
+                                  text=True, timeout=3)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                continue
+            data = json.loads(proc.stdout.strip().splitlines()[-1])
+            if isinstance(data, dict):
+                merged.update({k: v for k, v in data.items()
+                               if k in ("restore_cmd", "restore_note")})
+        except Exception:
+            continue
+    return merged or None
+
+
+# --------------------------------------------------------------------------
+# pi session correlation
+# --------------------------------------------------------------------------
+
+def pi_index():
+    """Every pi session file with its start time, working dir and id."""
+    out = []
+    for path in glob.glob(os.path.join(PI_SESSIONS, "*", "*.jsonl")):
+        try:
+            with open(path) as f:
+                hdr = json.loads(f.readline())
+            if hdr.get("type") != "session":
+                continue
+            stamp = datetime.strptime(hdr["timestamp"].replace("Z", "+0000"),
+                                      "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+            out.append({
+                "path": path,
+                "id": hdr.get("id"),
+                "cwd": hdr.get("cwd"),
+                "start": stamp,
+                "mtime": os.path.getmtime(path),
+                "size": os.path.getsize(path),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def prev_session_sizes():
+    """Session file sizes as of the previous snapshot (for growth attribution)."""
+    try:
+        with open(LATEST) as f:
+            old = json.load(f)
+        return old.get("pi_session_sizes") or {}
+    except Exception:
+        return {}
+
+
+def resolve_pi(index, pids, prev_sizes):
+    """Map running pi processes to their session files.
+
+    Three signals, strongest first:
+      1. pi creates its session file within a second of starting, so the
+         process start time fingerprints the file.
+      2. A session resumed with `pi --resume` keeps an old header, so fall back
+         to comparing file sizes with the previous snapshot: the session that
+         grew while a pi process was unmatched is almost certainly that
+         process's. Only trusted when exactly one unmatched candidate grew.
+      3. Otherwise the newest unclaimed session for the same cwd, flagged as a
+         guess so restore can warn about it.
+
+    A session file is never assigned to two processes.
+    """
+    result, claimed = {}, set()
+    for pid in pids:
+        st = proc_start(pid)
+        if not st:
+            continue
+        best = None
+        for s in index:
+            if s["path"] in claimed:
+                continue
+            delta = abs(s["start"] - st)
+            if delta > START_TOLERANCE:
+                continue
+            rank = (0 if s["cwd"] == link("/proc/%d/cwd" % pid) else 1, delta)
+            if best is None or rank < best[0]:
+                best = (rank, s)
+        if best:
+            claimed.add(best[1]["path"])
+            result[pid] = {"session": best[1], "guess": False, "source": "start-time"}
+
+    unmatched = [p for p in pids if p not in result]
+    grown = [s for s in index
+             if s["path"] not in claimed and prev_sizes.get(s["path"], s["size"]) < s["size"]]
+    if len(unmatched) == 1 and len(grown) == 1:
+        s = grown[0]
+        claimed.add(s["path"])
+        result[unmatched[0]] = {"session": s, "guess": False, "source": "activity"}
+
+    now = time.time()
+    for pid in pids:
+        if pid in result:
+            continue
+        cwd = link("/proc/%d/cwd" % pid)
+        free = [s for s in index
+                if s["path"] not in claimed and s["cwd"] == cwd and now - s["mtime"] < 900]
+        if free:
+            s = max(free, key=lambda x: x["mtime"])
+            claimed.add(s["path"])
+            result[pid] = {"session": s, "guess": True, "source": "newest-for-cwd"}
+    return result
+
+
+def session_record(entry):
+    if not entry:
+        return None
+    s = entry["session"]
+    return {"id": s["id"], "path": s["path"], "cwd": s["cwd"],
+            "guess": entry["guess"], "source": entry["source"]}
+
+
+# --------------------------------------------------------------------------
+# kitty
+# --------------------------------------------------------------------------
+
+def kitty_sockets():
+    """(target, pid) for every reachable kitty instance."""
+    socks = []
+    env = os.environ.get("KITTY_LISTEN_ON")
+    if env:
+        socks.append(env if env.startswith("unix:") else "unix:" + env)
+    for pattern in ("/run/user/%d/omarchy-kitty-*" % UID,
+                    "/run/user/%d/kitty-*" % UID,
+                    "/tmp/kitty-%d-*" % UID):
+        socks.extend("unix:" + p for p in glob.glob(pattern))
+    out, seen = [], set()
+    for sock in socks:
+        if sock in seen:
+            continue
+        seen.add(sock)
+        tail = os.path.basename(sock.replace("unix:", ""))
+        digits = "".join(ch for ch in tail[::-1].split("-")[0][::-1] if ch.isdigit())
+        pid = int(digits) if digits.isdigit() else None
+        out.append((sock, pid))
+    return out
+
+
+def kitty_ls(sock):
+    rc, out, _ = run(["kitty", "@", "--to", sock, "ls"], timeout=6)
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def kitty_text(sock, win_id):
+    rc, out, _ = run(["kitty", "@", "--to", sock, "get-text",
+                      "--match", "id:%d" % int(win_id), "--extent", "screen"], timeout=6)
+    return out if rc == 0 else ""
+
+
+def save_text(name, text):
+    if not text:
+        return None
+    text = text[-MAX_TEXT:]
+    os.makedirs(SCROLL, exist_ok=True)
+    rel = os.path.join("scrollback", name)
+    with open(os.path.join(STATE, rel), "w") as f:
+        f.write(text)
+    return rel
+
+
+# --------------------------------------------------------------------------
+# tmux
+# --------------------------------------------------------------------------
+
+def tmux_raw():
+    rc, out, _ = run(["tmux", "list-sessions", "-F", "#{session_name}"])
+    if rc != 0:
+        return None
+    sessions = [s.strip() for s in out.splitlines() if s.strip()]
+    rc, out, _ = run(["tmux", "list-panes", "-a", "-F",
+                      "#{session_name}\t#{window_index}\t#{window_name}\t"
+                      "#{pane_index}\t#{pane_current_command}\t#{pane_current_path}\t"
+                      "#{pane_pid}\t#{pane_active}\t#{pane_title}"])
+    if rc != 0:
+        return {"sessions": sessions, "panes": []}
+    panes = []
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) < 9:
+            continue
+        sess, widx, wname, pidx, cmd, cwd, pid, active, title = f[:9]
+        rc2, text, _ = run(["tmux", "capture-pane", "-p", "-t",
+                            "%s:%s.%s" % (sess, widx, pidx),
+                            "-S", "-%d" % SCROLL_LINES], timeout=6)
+        text = "\n".join(text.splitlines()[-SCROLL_LINES:]) if rc2 == 0 else ""
+        panes.append({
+            "session": sess, "window": int(widx), "window_name": wname,
+            "pane": int(pidx), "command": cmd, "cwd": cwd, "pid": int(pid),
+            "active": active == "1", "title": title,
+            "scrollback": save_text("tmux-%s-%s-%s.txt" % (sess, widx, pidx), text),
+        })
+    return {"sessions": sessions, "panes": panes}
+
+
+def pane_procs(pid):
+    return [pid] + children(pid)
+
+
+# --------------------------------------------------------------------------
+# snapshot
+# --------------------------------------------------------------------------
+
+def snapshot(quiet=False):
+    for sub in (SCROLL, HISTORY, RESTORE):
+        os.makedirs(sub, exist_ok=True)
+
+    index = pi_index()
+    prev_sizes = prev_session_sizes()
+    monitors = hypr_json("monitors") or []
+    mon_by_id = {m.get("id"): m.get("name") for m in monitors}
+
+    # No answer is not an empty desktop. It is what a compositor on its way out
+    # (or wedged) looks like, and recording it as empty is what let a snapshot
+    # taken mid-shutdown replace a full one and restore nothing at boot.
+    clients = hypr_json("clients")
+    if clients is None:
+        sys.stderr.write("deskstate: hyprctl clients did not answer, "
+                         "snapshot skipped\n")
+        return None
+
+    windows, by_pid = [], {}
+    desc_by_id = {m.get("id"): m.get("description") for m in monitors}
+    for c in clients:
+        pid = c.get("pid") or 0
+        wsid = (c.get("workspace") or {}).get("id")
+        rec = {
+            "address": c.get("address"),
+            "class": c.get("class"),
+            "initial_class": c.get("initialClass"),
+            "title": c.get("title"),
+            "initial_title": c.get("initialTitle"),
+            "pid": pid,
+            "workspace": wsid,
+            "slot": slot_of(wsid),
+            "monitor": mon_by_id.get(c.get("monitor"), c.get("monitor")),
+            "monitor_desc": desc_by_id.get(c.get("monitor")),
+            "at": c.get("at"),
+            "size": c.get("size"),
+            "floating": c.get("floating"),
+            "fullscreen": c.get("fullscreen"),
+            "cmdline": cmdline(pid),
+            "cwd": link("/proc/%d/cwd" % pid) if pid else None,
+        }
+        if is_browser_class(rec["class"]):
+            # recorded now, because a browser's own cmdline cannot be replayed
+            argv = browser_launch(rec)
+            rec["extras"] = {"restore_cmd": argv} if argv else None
+        else:
+            rec["extras"] = run_extractors(rec)
+        windows.append(rec)
+        by_pid.setdefault(pid, []).append(rec)
+
+    # --- kitty (raw), collecting every pi pid we can see
+    kitty, pi_pids = [], []
+    for sock, kpid in kitty_sockets():
+        data = kitty_ls(sock)
+        if not data:
+            continue
+        inst = {"socket": sock, "pid": kpid, "os_windows": []}
+        for o in data:
+            ow = {"id": o.get("id"), "tabs": [], "placement": None}
+            for t in o.get("tabs", []):
+                tab = {"id": t.get("id"), "title": t.get("title"),
+                       "active": t.get("is_active"), "windows": []}
+                for w in t.get("windows", []):
+                    procs = [{"pid": p.get("pid"), "cmdline": p.get("cmdline") or [],
+                              "cwd": p.get("cwd")}
+                             for p in (w.get("foreground_processes") or [])]
+                    for p in procs:
+                        if base(p["cmdline"]) == "pi" and p["pid"]:
+                            pi_pids.append(p["pid"])
+                    rec = {
+                        "id": w.get("id"),
+                        "title": w.get("title"),
+                        "cwd": w.get("cwd"),
+                        "last_cmdline": w.get("last_reported_cmdline"),
+                        "foreground": procs,
+                        "pi_pids": [p["pid"] for p in procs
+                                    if base(p["cmdline"]) == "pi" and p["pid"]],
+                        "ssh": next((p["cmdline"] for p in procs
+                                     if base(p["cmdline"]) == "ssh"), None),
+                        "shell": next((p["cmdline"][0] for p in procs
+                                       if base(p["cmdline"]) in SHELLS), None),
+                        "pi_session": None,
+                        "scrollback": None,
+                    }
+                    text = kitty_text(sock, w.get("id"))
+                    rec["scrollback"] = save_text(
+                        "kitty-%s-tab%s-win%s.txt" % (o.get("id"), t.get("id"), w.get("id")),
+                        "\n".join(text.splitlines()[-SCROLL_LINES:]))
+                    tab["windows"].append(rec)
+                ow["tabs"].append(tab)
+            inst["os_windows"].append(ow)
+        kitty.append(inst)
+
+    # --- tmux (raw)
+    tmux = tmux_raw()
+    if tmux:
+        for p in tmux["panes"]:
+            procs = []
+            for cand in pane_procs(p["pid"]):
+                c = cmdline(cand)
+                if not c:
+                    continue
+                if base(c) == "pi":
+                    p.setdefault("pi_pids", []).append(cand)
+                    pi_pids.append(cand)
+                elif base(c) == "ssh":
+                    p["ssh"] = c
+            p.setdefault("pi_pids", [])
+
+    # --- resolve pi sessions once, for kitty windows and tmux panes alike
+    mapping = resolve_pi(index, sorted(set(pi_pids)), prev_sizes)
+    for inst in kitty:
+        for ow in inst["os_windows"]:
+            for tab in ow["tabs"]:
+                for w in tab["windows"]:
+                    for pid in w["pi_pids"]:
+                        if pid in mapping:
+                            w["pi_session"] = session_record(mapping[pid])
+                            break
+    if tmux:
+        for p in tmux["panes"]:
+            for pid in p.get("pi_pids", []):
+                if pid in mapping:
+                    p["pi_session"] = session_record(mapping[pid])
+                    break
+
+    # --- link each kitty OS window to its Hyprland window (placement)
+    for inst in kitty:
+        cands = by_pid.get(inst["pid"], [])
+        for ow in inst["os_windows"]:
+            pick = None
+            if len(cands) == 1:
+                pick = cands[0]
+            else:
+                titles = [t.get("title") for t in ow["tabs"] if t.get("title")]
+                pick = next((c for c in cands if c.get("title") in titles), None)
+                if pick is None and len(cands) > 1:
+                    active = [t["title"] for t in ow["tabs"] if t.get("active")]
+                    pick = next((c for c in cands
+                                 if active and c.get("title") == active[0]), None)
+            if pick:
+                ow["placement"] = {k: pick.get(k) for k in
+                                   ("workspace", "slot", "monitor", "monitor_desc",
+                                    "at", "size", "floating", "fullscreen")}
+                pick["kitty_os_window"] = ow["id"]
+
+    # browser tabs, matched to their window by the active tab's title
+    tabs = browser_tabs()
+    browser = {"available": bool(tabs), "tabs": tabs or [], "unassigned": []}
+    if tabs:
+        used = set()
+        for w in windows:
+            if not is_browser_class(w["class"]) or not w.get("title"):
+                continue
+            match = next((t for i, t in enumerate(tabs)
+                          if i not in used and t["title"] == w["title"]), None)
+            if match is not None:
+                used.add(tabs.index(match))
+                w["tab"] = match
+        browser["unassigned"] = [t for i, t in enumerate(tabs) if i not in used]
+
+    snap = {
+        "taken": time.time(),
+        "taken_iso": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "active_workspace": (hypr_json("activeworkspace") or {}).get("id"),
+        "monitors": [{k: m.get(k) for k in
+                      ("id", "name", "description", "x", "y", "width", "height",
+                       "scale", "transform", "focused", "refreshRate")}
+                     for m in monitors],
+        "windows": windows,
+        "kitty": kitty,
+        "tmux": tmux,
+        "browser": browser,
+        "hints": build_hints(kitty, tmux),
+        "pi_session_sizes": {s["path"]: s["size"] for s in index},
+    }
+
+    # An empty desktop and one whose windows were destroyed a moment ago by the
+    # session teardown look the same. Only believe empty after it holds still
+    # for a few snapshots, so the last minute before a reboot is not lost.
+    if not windows and not kitty:
+        streak = read_int(EMPTY_STREAK) + 1
+        write_int(EMPTY_STREAK, streak)
+        if streak < EMPTY_STREAK_LIMIT:
+            sys.stderr.write("deskstate: desktop looks empty (%d/%d), snapshot "
+                             "skipped\n" % (streak, EMPTY_STREAK_LIMIT))
+            return None
+    else:
+        write_int(EMPTY_STREAK, 0)
+
+    with open(LATEST, "w") as f:
+        json.dump(snap, f, indent=1)
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime(snap["taken"]))
+    with gzip.open(os.path.join(HISTORY, stamp + ".json.gz"), "wt") as f:
+        json.dump(snap, f)
+    write_summary(snap)
+    prune()
+    if not quiet:
+        print("\n".join(summary_lines(snap)))
+    return snap
+
+
+def build_hints(kitty, tmux):
+    """What to tell the user after a restore: per terminal, the last command."""
+    hints = []
+    for inst in kitty:
+        for ow in inst.get("os_windows", []):
+            for tab in ow.get("tabs", []):
+                for w in tab["windows"]:
+                    if w.get("ssh"):
+                        hints.append({"terminal": tab.get("title"),
+                                      "kind": "ssh",
+                                      "command": " ".join(w["ssh"]),
+                                      "cwd": w.get("cwd")})
+    for p in (tmux or {}).get("panes", []):
+        if p.get("ssh"):
+            hints.append({"terminal": "%s:%s.%s" % (p["session"], p["window"], p["pane"]),
+                          "kind": "ssh", "command": " ".join(p["ssh"]),
+                          "cwd": p.get("cwd")})
+    return hints
+
+
+def summary_lines(snap):
+    out = ["deskstate %s" % snap.get("taken_iso", ""),
+           "monitors: %d   windows: %d   kitty instances: %d"
+           % (len(snap.get("monitors") or []), len(snap.get("windows") or []),
+              len(snap.get("kitty") or []))]
+    for inst in snap.get("kitty") or []:
+        for ow in inst.get("os_windows", []):
+            plc = ow.get("placement") or {}
+            out.append(" kitty window on %s (ws %s)" % (plc.get("monitor"), plc.get("workspace")))
+            for tab in ow.get("tabs", []):
+                for w in tab.get("windows", []):
+                    out.append("   tab %-28s %s  (%s)"
+                               % ((tab.get("title") or "")[:28],
+                                  describe_process(w), w.get("cwd")))
+    tm = snap.get("tmux")
+    if tm:
+        out.append(" tmux sessions: %s" % ", ".join(tm.get("sessions") or []))
+        for p in tm.get("panes", []):
+            out.append("   %s:%s.%s  %-22s %s  %s"
+                       % (p["session"], p["window"], p["pane"],
+                          describe_process(p), p.get("cwd") or "",
+                          (p.get("title") or "")[:28]))
+    br = snap.get("browser") or {}
+    if br.get("tabs"):
+        out.append(" browser tabs (%d%s):" % (len(br["tabs"]),
+                                              "" if br.get("available") else ", not live"))
+        for t in br["tabs"][:12]:
+            out.append("   %s" % (t.get("url") or "")[:90])
+    elif br and not br.get("available"):
+        out.append(" browser tabs: not captured (DevTools port not listening)")
+    apps = [w for w in snap.get("windows") or []
+            if not (w.get("class") or "").startswith("kitty")]
+    if apps:
+        out.append(" other windows:")
+        for w in apps:
+            out.append("   %-24s ws %-3s %-7s %s"
+                       % ((w.get("class") or "")[:24], w.get("workspace"),
+                          w.get("monitor"), (w.get("title") or "")[:40]))
+    return out
+
+
+def describe_process(w):
+    ps = w.get("pi_session")
+    if ps:
+        tag = " (guess)" if ps.get("guess") else ""
+        return "pi %s%s" % (ps["id"][:13], tag)
+    if w.get("ssh"):
+        return "ssh: %s" % " ".join(w["ssh"])[:40]
+    fg = w.get("foreground") or []
+    if fg:
+        return " ".join(fg[0]["cmdline"])[:44]
+    return w.get("command") or "shell"
+
+
+def write_summary(snap):
+    with open(os.path.join(STATE, "summary.txt"), "w") as f:
+        f.write("\n".join(summary_lines(snap)) + "\n")
+
+
+def prune():
+    files = sorted(glob.glob(os.path.join(HISTORY, "*.json.gz")))
+    for path in files[:-KEEP_SNAPSHOTS]:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# restore
+# --------------------------------------------------------------------------
+
+def running_pi_pids():
+    pids = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        c = cmdline(int(d))
+        if c and base(c) == "pi":
+            pids.append(int(d))
+    return pids
+
+
+def live_pi_sessions():
+    """Session files that a pi process has open right now.
+
+    Restoring a snapshot on a desktop that is still running would otherwise
+    start a second pi on a session file that is already in use.
+    """
+    pids = running_pi_pids()
+    if not pids:
+        return set()
+    index = pi_index()
+    mapping = resolve_pi(index, pids, prev_session_sizes())
+    return {e["session"]["path"] for e in mapping.values()}
+
+
+def ssh_rcfile(command, tag):
+    """An rc file that puts the old ssh command on the history stack.
+
+    While ssh is still running, bash has only flushed the commands typed
+    before it - the ssh line itself lives in the shell's memory, so a power cut
+    loses it. The command line is taken from the process table instead and
+    pushed into history here, so Up-arrow recalls it in the restored tab.
+    """
+    os.makedirs(RESTORE, exist_ok=True)
+    path = os.path.join(RESTORE, "rc-%s.sh" % tag)
+    quoted = " ".join(shlex.quote(x) for x in command)
+    with open(path, "w") as f:
+        f.write("# generated by deskstate restore\n"
+                '[[ -f ~/.bashrc ]] && source ~/.bashrc\n'
+                "history -s %s\n"
+                "printf '\\n\\033[2m[deskstate] Up-arrow reconnects the ssh session that "
+                "was open here:\\033[0m\\n  %s\\n\\n'\n"
+                % (shlex.quote(quoted), command[0] + " " +
+                   " ".join(shlex.quote(x) for x in command[1:])))
+    return path
+
+
+def command_for(win, opts):
+    """What to run in a restored terminal."""
+    if win.get("pi_session"):
+        return ["pi", "--session", win["pi_session"]["id"]]
+    if any(base(p["cmdline"]) == "pi" for p in (win.get("foreground") or [])):
+        return ["pi"]
+    if win.get("ssh") and opts.reconnect_ssh:
+        return list(win["ssh"])
+    if win.get("ssh"):
+        tag = str(win.get("id") or "x")
+        return ["/bin/bash", "--rcfile", ssh_rcfile(win["ssh"], tag)]
+    fg = win.get("foreground") or []
+    if fg and base(fg[0]["cmdline"]) == "tmux":
+        return list(fg[0]["cmdline"])
+    return [win.get("shell") or "/bin/bash"]
+
+
+def kitty_conf(ow, opts, path):
+    lines = ["# generated by deskstate restore"]
+    first = True
+    for tab in ow.get("tabs", []):
+        for w in tab.get("windows", []):
+            if not first:
+                lines.append("new_tab")
+            first = False
+            args = ["--cwd=%s" % (w.get("cwd") or HOME)]
+            if tab.get("title"):
+                args.append("--title=%s" % tab["title"])
+            lines.append("launch %s %s"
+                         % (" ".join(a if " " not in a else shlex.quote(a) for a in args),
+                            " ".join(shlex.quote(c) for c in command_for(w, opts))))
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def without_live_pi(ow, live):
+    """Drop windows (and empty tabs) whose pi session is still in use."""
+    dropped, tabs = [], []
+    for tab in ow.get("tabs", []):
+        keep = []
+        for w in tab["windows"]:
+            ps = w.get("pi_session")
+            if ps and ps["path"] in live:
+                dropped.append("skipping %s: pi session %s is still running"
+                               % (tab.get("title"), ps["id"][:13]))
+                continue
+            keep.append(w)
+        if keep:
+            tab = dict(tab, windows=keep)
+            tabs.append(tab)
+    return dict(ow, tabs=tabs), dropped
+
+
+def tmux_plan(tm, opts, live=None):
+    live = live or set()
+    cmds = []
+    by_win = {}
+    for p in tm.get("panes", []):
+        by_win.setdefault((p["session"], p["window"]), []).append(p)
+    first_window = {}
+    for (sess, widx), panes in sorted(by_win.items()):
+        panes.sort(key=lambda p: p["pane"])
+        head = panes[0]
+        cwd = head.get("cwd") or HOME
+        name = head.get("window_name") or "shell"
+        if sess not in first_window:
+            first_window[sess] = True
+            cmds.append("tmux has-session -t %s 2>/dev/null || "
+                        "tmux new-session -d -s %s -c %s -n %s"
+                        % (shlex.quote(sess), shlex.quote(sess),
+                           shlex.quote(cwd), shlex.quote(name)))
+        else:
+            cmds.append("tmux new-window -d -t %s: -c %s -n %s"
+                        % (shlex.quote(sess), shlex.quote(cwd), shlex.quote(name)))
+        for extra in panes[1:]:
+            cmds.append("tmux split-window -t %s:%s -c %s"
+                        % (shlex.quote(sess), widx, shlex.quote(extra.get("cwd") or HOME)))
+        for p in panes:
+            target = "%s:%s.%s" % (sess, widx, p["pane"])
+            if p.get("pi_session") and p["pi_session"]["path"] not in live:
+                cmds.append("tmux send-keys -t %s %s C-m"
+                            % (shlex.quote(target),
+                               shlex.quote("pi --session %s" % p["pi_session"]["id"])))
+            elif p.get("ssh"):
+                cmd = " ".join(shlex.quote(x) for x in p["ssh"])
+                if opts.reconnect_ssh:
+                    cmds.append("tmux send-keys -t %s %s C-m"
+                                % (shlex.quote(target), shlex.quote(cmd)))
+                else:
+                    # typed but not executed: press Enter to reconnect
+                    cmds.append("tmux send-keys -t %s %s"
+                                % (shlex.quote(target), shlex.quote(cmd)))
+    return cmds
+
+
+def wait_for_new(before, seconds=20):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        now = {c["address"]: c for c in (hypr_json("clients") or [])}
+        new = [c for a, c in now.items() if a not in before]
+        if new:
+            return new
+        time.sleep(0.25)
+    return []
+
+
+def wait_for_class(before, cls, seconds=20):
+    """Wait for a window of this class to appear (Chromium can take a while)."""
+    want = (cls or "").lower()
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        for c in hypr_json("clients") or []:
+            if c.get("address") in before:
+                continue
+            if (c.get("class") or "").lower() == want:
+                return c
+        time.sleep(0.25)
+    return None
+
+
+def win_state(address):
+    for c in hypr_json("clients") or []:
+        if c.get("address") == address:
+            return c
+    return None
+
+
+def slot_of(workspace_id):
+    """Which of a monitor's ten workspaces this is, or None for a special one."""
+    try:
+        wsid = int(workspace_id)
+    except (TypeError, ValueError):
+        return None
+    if wsid < 1:
+        return None
+    return (wsid - 1) % SLOTS + 1
+
+
+def blocks_by_identity():
+    """Monitor identity (make/model/serial) -> workspace block, from Omarchy.
+
+    Omarchy gives every monitor a block of ten workspaces and keeps the mapping
+    in this file. Reading it means deskstate resolves a workspace the same way
+    the bar and the keybindings do.
+    """
+    blocks = {}
+    try:
+        with open(OMARCHY_WS_STATE) as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 3:
+                    continue
+                try:
+                    blocks[parts[2]] = int(parts[0])
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return blocks
+
+
+def live_block(monitor):
+    """The block a monitor is using now, when Omarchy's file says nothing."""
+    ids = []
+    for w in hypr_json("workspaces") or []:
+        if (w.get("id") or 0) >= 1 and w.get("monitor") == monitor.get("name"):
+            ids.append(w["id"])
+    if not ids:
+        return None
+    return (min(ids) - 1) // SLOTS
+
+
+def target_workspace(plc):
+    """Where this recorded window belongs *now*, not where it was.
+
+    Workspace ids are not stable: Omarchy renumbers a monitor's block when a
+    monitor comes or goes, and Hyprland hands the lowest free id to whatever is
+    new, so replaying a raw id from the snapshot can land a window on another
+    monitor or one workspace over. The slot inside the monitor's block is
+    stable, and the block is looked up by the monitor's make/model/serial.
+    """
+    slot = plc.get("slot")
+    if not slot:
+        return plc.get("workspace")
+
+    live = hypr_json("monitors") or []
+    desc = plc.get("monitor_desc") or ""
+    mon = next((m for m in live if m.get("name") == plc.get("monitor")), None)
+    if mon is None and desc:
+        mon = next((m for m in live if m.get("description") == desc), None)
+    if mon is None:
+        return None                      # that monitor is not connected
+
+    block = blocks_by_identity().get(mon.get("description") or "")
+    if block is None:
+        block = live_block(mon)
+    if block is None:
+        return plc.get("workspace")      # nothing to go on, best effort
+
+    return block * SLOTS + slot
+
+
+def set_fullscreen(address, state):
+    """Put a window back into its recorded fullscreen state.
+
+    Hyprland's `fullscreen` is 0 none, 1 maximized, 2 fullscreen, 3 both.
+    SUPER + F sets 2, SUPER + ALT + F sets 1. Setting each mode explicitly
+    (action "set"/"unset") instead of toggling means it is idempotent: a
+    toggle-based restore kept cycling a truly fullscreen window between
+    fullscreen and fullscreen+maximized and could drop it entirely.
+    """
+    try:
+        state = int(state or 0)
+    except (TypeError, ValueError):
+        state = 0
+    win = "address:%s" % address
+    for mode, wanted in (("fullscreen", state in (2, 3)),
+                         ("maximized", state in (1, 3))):
+        hypr_eval('hl.dispatch(hl.dsp.window.fullscreen({ window = "%s", '
+                  'mode = "%s", action = "%s" }))'
+                  % (win, mode, "set" if wanted else "unset"))
+
+
+def place(address, plc):
+    """Put a fresh window back where the snapshot says it was."""
+    if not address or not plc:
+        return
+    win = "address:%s" % address
+
+    if plc.get("floating"):
+        hypr_eval('hl.dispatch(hl.dsp.window.float({ window = "%s", action = "on" }))' % win)
+
+    # workspace first, so fullscreen and geometry land on the right monitor
+    if plc.get("workspace") is not None:
+        ws = target_workspace(plc)
+        if ws is not None:
+            hypr_eval('hl.dispatch(hl.dsp.window.move({ window = "%s", workspace = "%s" }))'
+                      % (win, ws))
+
+    set_fullscreen(address, plc.get("fullscreen"))
+
+    if plc.get("floating"):
+        size = plc.get("size") or [0, 0]
+        at = plc.get("at") or [0, 0]
+        if size[0] and size[1]:
+            hypr_eval('hl.dispatch(hl.dsp.window.resize({ window = "%s", x = %d, y = %d }))'
+                      % (win, size[0], size[1]))
+        hypr_eval('hl.dispatch(hl.dsp.window.move({ window = "%s", x = %d, y = %d }))'
+                  % (win, at[0], at[1]))
+
+
+
+
+def has_content(snap):
+    return bool((snap or {}).get("windows") or (snap or {}).get("kitty"))
+
+
+def load_snapshot():
+    """The last snapshot, and the one actually used when that is empty.
+
+    An empty last snapshot is usually a teardown race rather than a desktop the
+    user deliberately emptied, so fall back to the newest one that still had
+    windows or terminals instead of restoring nothing.
+    """
+    if not os.path.exists(LATEST):
+        return None, None
+    with open(LATEST) as f:
+        snap = json.load(f)
+    if has_content(snap):
+        return snap, None
+
+    for path in sorted(glob.glob(os.path.join(HISTORY, "*.json.gz")), reverse=True):
+        try:
+            with gzip.open(path, "rt") as f:
+                older = json.load(f)
+        except Exception:
+            continue
+        if has_content(older):
+            return older, path
+
+    return snap, None
+
+
+def restore(opts):
+    snap, substituted = load_snapshot()
+    if snap is None:
+        sys.stderr.write("deskstate: no snapshot yet - run `deskstate snapshot`\n")
+        return 1
+    if substituted:
+        print("last snapshot held no windows or terminals; restoring %s instead"
+              % snap.get("taken_iso"))
+
+    plan = []
+    if opts.only in ("all", "tmux") and snap.get("tmux") and snap["tmux"].get("panes"):
+        plan.append(("tmux", tmux_plan(snap["tmux"], opts)))
+
+    skipped = []
+    live = set() if opts.force else live_pi_sessions()
+    kitty_jobs = []
+    if opts.only in ("all", "kitty"):
+        os.makedirs(RESTORE, exist_ok=True)
+        for inst in snap.get("kitty") or []:
+            for n, ow in enumerate(inst.get("os_windows", [])):
+                ow, dropped = without_live_pi(ow, live)
+                skipped.extend(dropped)
+                if not ow["tabs"]:
+                    continue
+                path = os.path.join(RESTORE, "kitty-%s-%d.conf" % (inst.get("pid"), n))
+                kitty_conf(ow, opts, path)
+                kitty_jobs.append({"conf": path,
+                                   "placement": ow.get("placement"),
+                                   "titles": [t.get("title") for t in ow.get("tabs", [])
+                                              if t.get("title")]})
+                plan.append(("kitty", path))
+
+    app_jobs = []
+    if opts.only in ("all", "apps"):
+        live_classes = {(c.get("class") or "") for c in (hypr_json("clients") or [])}
+        for w in snap.get("windows") or []:
+            cl = w.get("class") or ""
+            if "kitty" in cl or w.get("kitty_os_window"):
+                continue
+            argv = launch_argv(w)
+            if not argv:
+                skipped.append("skipping %s: no launch command was recorded"
+                               % ((w.get("title") or "")[:40],))
+                continue
+            if not opts.force and cl in live_classes:
+                skipped.append("skipping %s: %s is already running"
+                               % ((w.get("title") or "")[:40], cl))
+                continue
+            url = (w.get("tab") or {}).get("url")
+            if opts.browser_tabs and url and is_browser_class(cl) \
+                    and "--app-id=" not in " ".join(argv):
+                argv = argv + ([url] if "--new-window" in argv
+                               else ["--new-window", url])
+            app_jobs.append((w, argv))
+            plan.append(("app", (w, argv)))
+
+    for message in skipped:
+        print(message)
+
+    if opts.dry_run:
+        for kind, item in plan:
+            if kind == "tmux":
+                for c in item:
+                    print("tmux: %s" % c)
+            elif kind == "kitty":
+                print("kitty --session %s" % item)
+                for line in read(item).splitlines():
+                    print("    " + line)
+            else:
+                w, argv = item
+                print("app: %-52s ws %s on %s  %s"
+                      % (" ".join(argv)[:52], w.get("workspace"), w.get("monitor"),
+                         ((w.get("tab") or {}).get("url") or "")[:50]))
+        for h in snap.get("hints") or []:
+            print("hint: %s -> press Up for: %s" % (h["terminal"], h["command"]))
+        return 0
+
+    before = {c["address"] for c in (hypr_json("clients") or [])}
+
+    for kind, item in plan:
+        if kind != "tmux":
+            continue
+        for c in item:
+            run(["bash", "-lc", c], timeout=10)
+
+    for job in kitty_jobs:
+        run(["bash", "-lc", "setsid kitty --session %s >/dev/null 2>&1 &"
+             % shlex.quote(job["conf"])], timeout=10)
+        for c in wait_for_new(before, 15):
+            before.add(c["address"])
+            if not job["placement"]:
+                break
+            if (c.get("title") in job["titles"]) or ("kitty" in (c.get("class") or "")):
+                place(c["address"], job["placement"])
+                break
+
+    app_failures = []
+    for w, argv in app_jobs:
+        cwd = w.get("cwd") or HOME
+        is_browser = is_browser_class(w.get("class"))
+        # 45s was not enough for a Qt app on a cold boot with the compositor
+        # still bringing four outputs up: vitals was reported as "did not come
+        # back" and then appeared a few seconds later.
+        wait = 60 if is_browser else 45
+        found = None
+        for attempt, prefix in enumerate(([], ["uwsm-app", "--"])):
+            if attempt and found:
+                break
+            fresh = {c["address"] for c in (hypr_json("clients") or [])}
+            run(["bash", "-lc", "cd %s && setsid %s >>%s 2>&1 &"
+                 % (shlex.quote(cwd),
+                    " ".join(shlex.quote(x) for x in prefix + list(argv)),
+                    shlex.quote(APPS_LOG))],
+                timeout=10)
+            found = wait_for_class(fresh, w.get("class") or "", wait)
+            if not found and attempt == 0:
+                with open(APPS_LOG, "a") as f:
+                    f.write("%s retry via uwsm-app: %s\n"
+                            % (datetime.now().isoformat(timespec="seconds"),
+                               " ".join(argv)))
+        if not found:
+            print("  ! %s (%s) did not come back - see %s"
+                  % ((w.get("title") or "")[:40], w.get("class"), APPS_LOG))
+            app_failures.append(w)
+            continue
+        before.add(found["address"])
+        place(found["address"], {k: w.get(k) for k in
+                                 ("workspace", "slot", "monitor", "monitor_desc",
+                                  "at", "size", "floating", "fullscreen")})
+
+    if app_failures:
+        print("%d app(s) did not reopen; `deskstate reconcile --apply` will try "
+              "again on the next pass" % len(app_failures))
+
+    print("restored from %s" % snap.get("taken_iso"))
+    for h in snap.get("hints") or []:
+        print("  %s: press Up for `%s`" % (h["terminal"], h["command"]))
+    for inst in snap.get("kitty") or []:
+        for ow in inst.get("os_windows", []):
+            for tab in ow.get("tabs", []):
+                for w in tab["windows"]:
+                    ps = w.get("pi_session")
+                    if ps and ps.get("guess"):
+                        print("  ! %s: pi session %s was guessed (%s) - use `pi -r` if it is wrong"
+                              % (tab.get("title"), ps["id"][:13], ps.get("source")))
+    return 0
+
+
+def reconcile(opts):
+    """Put windows back on the workspace the snapshot recorded.
+
+    Hyprland and Omarchy renumber workspaces when a monitor comes or goes, and
+    a window can end up one workspace over ("everything on desktop 1 moved to
+    desktop 2") with nothing having asked for it. This compares the live
+    desktop with the last snapshot and corrects the difference.
+
+    Only windows that can be identified without guessing are touched: the class
+    must match, and when several windows share a class the title must pick out
+    exactly one. Special workspaces are never touched.
+    """
+    snap, _ = load_snapshot()
+    if snap is None:
+        sys.stderr.write("deskstate: no snapshot yet - run `deskstate snapshot`\n")
+        return 1
+
+    by_class = {}
+    for c in hypr_json("clients") or []:
+        by_class.setdefault((c.get("class") or "").lower(), []).append(c)
+
+    def pick(cands, w):
+        """The live window that is this snapshot entry, or None if unsure."""
+        if len(cands) == 1:
+            return cands[0]
+        titled = [c for c in cands if (c.get("title") or "") == (w.get("title") or "")]
+        if len(titled) == 1:
+            return titled[0]
+        pool = titled or cands
+        at = w.get("at") or None
+        if not at:
+            return None
+        # several windows with the same class and title (two kitty windows both
+        # running pi): fall back to the one nearest the recorded position
+        scored = sorted(pool, key=lambda c: sum(abs(a - b) for a, b in
+                                               zip(c.get("at") or [0, 0], at)))
+        if len(scored) == 1:
+            return scored[0]
+        first = sum(abs(a - b) for a, b in zip(scored[0].get("at") or [0, 0], at))
+        second = sum(abs(a - b) for a, b in zip(scored[1].get("at") or [0, 0], at))
+        return scored[0] if second - first > 40 else None
+
+    fixes, ambiguous, absent = [], 0, 0
+    for w in snap.get("windows") or []:
+        cls = (w.get("class") or "").lower()
+        if not cls:
+            continue
+        cands = by_class.get(cls) or []
+        if not cands:
+            absent += 1
+            continue
+        live = pick(cands, w)
+        if live is None:
+            ambiguous += 1
+            continue
+
+        have = (live.get("workspace") or {}).get("id")
+        if have is None or have < 1:
+            continue                      # special workspace, leave it alone
+        want = target_workspace(w)
+        if want is None or want == have:
+            continue
+        fixes.append((live, w, have, want))
+
+    if not fixes:
+        print("nothing to fix (%d windows, %d app(s) not running, %d ambiguous)"
+              % (len((snap.get("windows") or [])), absent, ambiguous))
+        return 0
+
+    for live, w, have, want in fixes:
+        print("%s %-34s ws %-3s -> %-3s (%s slot %s)"
+              % ("move" if opts.apply else "would move",
+                 (live.get("title") or live.get("class") or "")[:34],
+                 have, want, w.get("monitor") or "?", w.get("slot")))
+        if not opts.apply:
+            continue
+        hypr_eval('hl.dispatch(hl.dsp.window.move({ window = "address:%s", '
+                  'workspace = "%s" }))' % (live["address"], want))
+        # a move can drop fullscreen/maximized; put back what was recorded
+        set_fullscreen(live["address"], w.get("fullscreen"))
+        try:
+            with open(RECONCILE_LOG, "a") as f:
+                f.write("%s  %s (%s) ws %s -> %s\n"
+                        % (datetime.now().astimezone().isoformat(timespec="seconds"),
+                           (live.get("title") or "")[:60], live.get("class"),
+                           have, want))
+        except OSError:
+            pass
+
+    if opts.apply:
+        print("%d window(s) put back" % len(fixes))
+    else:
+        print("%d window(s) out of place - re-run with --apply" % len(fixes))
+    return 0
+
+
+def event_socket():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % UID
+    path = os.path.join(base, "hypr", sig, ".socket2.sock")
+    return path if os.path.exists(path) else None
+
+
+def watch(opts):
+    """Reconcile when the compositor (not the user) moves windows around.
+
+    Two triggers, both structural:
+
+    * a monitor was added or removed - Omarchy renumbers blocks, windows shift;
+    * two or more windows landed on the same workspace within a couple of
+      seconds - that is a relocation, not a hand drag (one window at a time).
+
+    A single window moving is left alone: that is the user tidying up.
+    """
+    import select
+    import socket
+
+    path = event_socket()
+    if not path:
+        sys.stderr.write("deskstate watch: no Hyprland event socket\n")
+        return 1
+
+    def say(msg):
+        if not opts.quiet:
+            print("%s %s" % (datetime.now().strftime("%H:%M:%S"), msg), flush=True)
+
+    moves = []            # (monotonic, window address, destination workspace)
+    pending = None        # monotonic time to reconcile at
+    quiet_until = 0.0
+    last_v2 = 0.0
+
+    while True:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(path)
+        except OSError:
+            time.sleep(2)
+            continue
+        say("watching %s" % path)
+        buf = b""
+        deadline = None
+        while True:
+            now = time.monotonic()
+            if pending and now >= pending and now >= quiet_until:
+                pending = None
+                say("reconciling")
+                reconcile(argparse.Namespace(apply=True))
+                quiet_until = time.monotonic() + 3
+                moves.clear()
+            wait = 1.0
+            if pending:
+                wait = max(0.05, min(wait, pending - now))
+            try:
+                ready, _, _ = select.select([sock], [], [], wait)
+            except OSError:
+                break
+            if not ready:
+                continue
+            try:
+                chunk = sock.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                event = line.decode("utf-8", "replace")
+                name, _, payload = event.partition(">>")
+                if time.monotonic() < quiet_until:
+                    continue                      # our own moves
+                if name in ("monitoradded", "monitorremoved", "monitoraddedv2"):
+                    say("%s %s" % (name, payload.split(",")[0]))
+                    pending = time.monotonic() + 6
+                    continue
+                if name == "movewindowv2" or name == "movewindow":
+                    if name == "movewindow" and time.monotonic() - last_v2 < 5:
+                        continue          # the same move, reported twice
+                    if name == "movewindowv2":
+                        last_v2 = time.monotonic()
+                    parts = payload.split(",")
+                    if len(parts) < 2:
+                        continue
+                    addr, dest = parts[0], parts[-1]
+                    # one move emits both movewindow and movewindowv2, so key on
+                    # the window: only two *different* windows landing together
+                    # is a relocation rather than a hand drag.
+                    moves.append((time.monotonic(), addr, dest))
+                    moves[:] = [m for m in moves if time.monotonic() - m[0] < 3]
+                    for _, _, ws in moves:
+                        landed = {a for _, a, other in moves if other == ws}
+                        if len(landed) >= 2:
+                            say("%d windows jumped to workspace %s"
+                                % (len(landed), ws))
+                            pending = time.monotonic() + 1.5
+                            break
+
+
+def show(as_json=False):
+    if not os.path.exists(LATEST):
+        sys.stderr.write("deskstate: no snapshot yet\n")
+        return 1
+    with open(LATEST) as f:
+        snap = json.load(f)
+    if as_json:
+        print(json.dumps(snap, indent=1))
+    else:
+        print("\n".join(summary_lines(snap)))
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="deskstate", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    sp = sub.add_parser("snapshot", help="record the current desktop state")
+    sp.add_argument("--quiet", action="store_true")
+    sh = sub.add_parser("show", help="print the last snapshot")
+    sh.add_argument("--json", action="store_true")
+    sr = sub.add_parser("restore", help="rebuild the desktop from the last snapshot")
+    sr.add_argument("--dry-run", action="store_true")
+    sr.add_argument("--reconnect-ssh", action="store_true")
+    sr.add_argument("--browser-tabs", action="store_true",
+                    help="reopen each browser window with the tab it had")
+    sr.add_argument("--force", action="store_true",
+                    help="restore even things that are still running")
+    sr.add_argument("--only", choices=["all", "kitty", "apps", "tmux", "none"], default="all")
+    sub.add_parser("prune", help="drop old snapshots")
+    sc = sub.add_parser("reconcile", help="put windows back where the snapshot says")
+    sc.add_argument("--apply", action="store_true",
+                    help="move them (default: report only)")
+    sw = sub.add_parser("watch", help="reconcile on monitor changes")
+    sw.add_argument("--quiet", action="store_true")
+    sub.add_parser("preview", help="draw the last snapshot as a picture")
+    args = ap.parse_args(argv)
+
+    if args.cmd == "snapshot":
+        snapshot(quiet=args.quiet)
+        return 0
+    if args.cmd == "show":
+        return show(as_json=args.json)
+    if args.cmd == "restore":
+        return restore(args)
+    if args.cmd == "prune":
+        prune()
+        return 0
+    if args.cmd == "reconcile":
+        return reconcile(args)
+    if args.cmd == "watch":
+        return watch(args)
+    if args.cmd == "preview":
+        return run([os.path.join(HOME, ".local/bin/deskstate-preview")])[0]
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

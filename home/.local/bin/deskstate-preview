@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Render the deskstate snapshot as a picture: what a restore would rebuild."""
+import json
+import os
+import subprocess
+
+STATE = os.environ.get("DESKSTATE_STATE") or os.path.expanduser("~/.local/state/deskstate")
+SNAP = os.path.join(STATE, "latest.json")
+OUT = os.path.join(STATE, "preview")
+BG, PANEL, EDGE, DIM, TXT = "#0b0d12", "#12151c", "#2d333b", "#8b949e", "#e6edf3"
+
+s = json.load(open(SNAP))
+
+
+def logical(m):
+    w, h = m["width"] / (m.get("scale") or 1), m["height"] / (m.get("scale") or 1)
+    if (m.get("transform") or 0) in (1, 3):
+        w, h = h, w
+    return m["x"], m["y"], w, h
+
+
+mons = [(m, logical(m)) for m in s["monitors"]]
+W = max(x + w for _, (x, _, w, _) in mons)
+H = max(y + h for _, (_, y, _, h) in mons)
+SCALE = 0.203
+HEAD, FOOT = 130, 178
+CW, CH = int(W * SCALE) + 80, int(H * SCALE) + HEAD + FOOT
+OX, OY = 40, HEAD
+
+
+def X(v): return OX + v * SCALE
+def Y(v): return OY + v * SCALE
+def esc(t): return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def wrap(text, px, size, maxlines=3):
+    n = max(6, int(px / (size * 0.53)))
+    words, out, line = (text or "").split(), [], ""
+    for word in words:
+        if len(line) + len(word) + 1 <= n:
+            line = (line + " " + word).strip()
+        else:
+            out.append(line)
+            line = word
+            if len(out) == maxlines:
+                break
+    if line and len(out) < maxlines:
+        out.append(line)
+    if out and len(" ".join(out)) < len(text):
+        out[-1] = out[-1][: max(3, n - 1)] + "\u2026"
+    return out or [""]
+
+
+def ssh_short(argv):
+    """`ssh -i ~/x.pem user@host` -> `ssh user@host`."""
+    host = next((a for a in reversed(argv) if "@" in a), argv[-1] if argv else "")
+    return "ssh " + host
+
+
+def sid(ps):
+    i = ps["id"]
+    return i[:8] + "\u2026" + i[-4:]
+
+
+def kind(w):
+    c = (w.get("class") or "").lower()
+    if "kitty" in c:
+        return "kitty"
+    if any(h in c for h in ("edge", "chrome", "chromium", "brave", "vivaldi")):
+        return "browser"
+    return "other"
+
+
+STYLE = {"kitty": ("#3fb950", "#10231a", "#d7f5dd"),
+         "browser": ("#58a6ff", "#101d2e", "#cfe4ff"),
+         "other": ("#8b949e", "#191c22", "#c9d1d9")}
+
+kitty_terms = [w for i in s["kitty"] for o in i["os_windows"] for t in o["tabs"]
+               for w in t["windows"]]
+pi_sessions = [w["pi_session"] for w in kitty_terms if w.get("pi_session")]
+ssh_cmds = [w["ssh"] for w in kitty_terms if w.get("ssh")]
+browser = s.get("browser") or {}
+
+svg = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
+       'font-family="Liberation Sans, sans-serif">' % (CW, CH),
+       '<rect x="0" y="0" width="%d" height="%d" fill="%s"/>' % (CW, CH, BG)]
+
+svg.append('<text x="40" y="52" fill="%s" font-size="28" font-weight="bold">'
+           'Reboot right now \u2192 deskstate rebuilds this</text>' % TXT)
+svg.append('<text x="40" y="82" fill="%s" font-size="15">snapshot %s &#183; %d windows '
+           'across %d outputs &#183; %d kitty terminals with %d pi sessions&#160;&#160;|'
+           '&#160;&#160;tmux: %d panes</text>'
+           % (DIM, esc(s.get("taken_iso", "")), len(s["windows"]), len(mons),
+              len(kitty_terms), len(pi_sessions),
+              len((s.get("tmux") or {}).get("panes") or [])))
+svg.append('<text x="40" y="106" fill="#6e7681" font-size="14">browser tabs: %s</text>'
+           % ("captured via DevTools &#8594; each window reopens with its own tab"
+              if browser.get("tabs") else
+              "not captured (DevTools port off) &#8594; Edge restores its own tabs"))
+
+for m, (mx, my, mw, mh) in mons:
+    svg.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="9" fill="%s" '
+               'stroke="%s" stroke-width="1.5"/>'
+               % (X(mx), Y(my), mw * SCALE, mh * SCALE, PANEL, EDGE))
+    svg.append('<text x="%.1f" y="%.1f" fill="%s" font-size="13" font-weight="bold">%s'
+               '<tspan fill="#586069" font-weight="normal">  %dx%d &#183; %s</tspan></text>'
+               % (X(mx) + 9, Y(my) + 18, DIM, esc(m["name"]), mw, mh,
+                  esc("%.0fHz" % (m.get("refreshRate") or 0))))
+
+for w in s["windows"]:
+    k = kind(w)
+    col, bg, fg = STYLE[k]
+    wx, wy = w["at"]
+    px, py, pw, ph = X(wx), Y(wy), w["size"][0] * SCALE, w["size"][1] * SCALE
+    svg.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="6" fill="%s" '
+               'stroke="%s" stroke-width="1.7"/>'
+               % (px + 3, py + 3, pw - 6, ph - 6, bg, col))
+    svg.append('<text x="%.1f" y="%.1f" fill="#4d5560" font-size="10" '
+               'text-anchor="end">ws %s%s</text>'
+               % (px + pw - 12, py + 18, esc(str(w.get("workspace"))),
+                  " &#183; float" if w.get("floating") else ""))
+    lines = []
+    if k == "kitty":
+        tabs = None
+        for inst in s["kitty"]:
+            for o in inst["os_windows"]:
+                at = (o.get("placement") or {}).get("at")
+                if at and abs(at[0] - wx) < 40 and abs(at[1] - wy) < 40:
+                    tabs = o["tabs"]
+        for t in tabs or []:
+            for tw in t["windows"]:
+                ps = tw.get("pi_session")
+                if ps:
+                    act = "pi --session " + sid(ps)
+                elif tw.get("ssh"):
+                    act = "shell \u00b7 Up = " + ssh_short(tw["ssh"])
+                    act = act if len(act) <= 27 else act[:26] + "\u2026"
+                else:
+                    act = "shell"
+                lines.append((t.get("title") or "", fg, 12))
+                lines.append(("   \u2192 " + act, "#7ee787", 11))
+    else:
+        for ln in wrap(w.get("title") or "", pw - 26, 13, maxlines=max(1, int(ph / 60))):
+            lines.append((ln, fg, 13))
+        lines.append((w.get("class") or "", "#4d5560", 10.5))
+    y = py + 34
+    for text, fill, size in lines:
+        if y > py + ph - 6:
+            break
+        svg.append('<text x="%.1f" y="%.1f" fill="%s" font-size="%.1f">%s</text>'
+                   % (px + 11, y, fill, size, esc(text)))
+        y += size + 5
+
+fy = CH - FOOT + 34
+svg.append('<text x="40" y="%d" fill="%s" font-size="16" font-weight="bold">'
+           'On restore</text>' % (fy, TXT))
+row = 0
+notes = []
+for w in kitty_terms:
+    inst = next((t.get("title") for i in s["kitty"] for o in i["os_windows"]
+                 for t in o["tabs"] for tw in t["windows"] if tw is w), "")
+    if w.get("ssh"):
+        notes.append("%s: shell in %s, Up-arrow reconnects &#8594; %s"
+                     % (esc(inst or "terminal"), esc(w.get("cwd") or "~"),
+                        esc(ssh_short(w["ssh"]))))
+    elif w.get("pi_session"):
+        notes.append("%s: pi --session %s (resumes exactly where it was)"
+                     % (esc(inst or "terminal"), esc(sid(w["pi_session"]))))
+if (s.get("tmux") or {}).get("panes"):
+    notes.append("tmux %s: sessions, windows and panes rebuilt with their cwd"
+                 % esc(", ".join(s["tmux"]["sessions"])))
+for n in notes[:6]:
+    row += 1
+    svg.append('<text x="40" y="%d" fill="%s" font-size="13.5">&#8226; %s</text>'
+               % (fy + 24 * row, DIM, n))
+row += 1
+svg.append('<text x="40" y="%d" fill="#586069" font-size="13">&#8226; windows go back to their '
+           'monitor and workspace; floating ones get their exact size and position back</text>'
+           % (fy + 24 * row))
+row += 1
+svg.append('<text x="40" y="%d" fill="#586069" font-size="13">&#8226; anything still running is '
+           'skipped, not duplicated &#183; scrollback saved under '
+           '~/.local/state/deskstate/scrollback/</text>' % (fy + 24 * row))
+svg.append("</svg>")
+
+open(OUT + ".svg", "w").write("\n".join(svg))
+subprocess.run(["rsvg-convert", "-o", OUT + ".png", OUT + ".svg"], check=True)
+print(OUT + ".png")

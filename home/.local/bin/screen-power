@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# screen-power — turn the panels off and back on, and remember where they were.
+#
+#   screen-power off      every DDC-capable monitor to brightness 0 (panel dark)
+#   screen-power on       restore the brightness each monitor had
+#   screen-power status   what is cached and what the monitors report now
+#
+# Hyprland 0.56's `hl.dsp.dpms({action="disable"})` is accepted and does
+# nothing on this build (dpmsStatus never changes), which is why Omarchy's
+# blank appeared to work but left the panels lit. DDC/CI brightness 0 turns
+# the backlight off on all four monitors here, and any key press wakes them
+# because the panel never leaves the compositor.
+#
+# Called by the lock screen (see omarchy-patch-idle-blank), not by hand.
+
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/screen-power"
+CACHE="$STATE_DIR/brightness"
+LOCK="$STATE_DIR/lock"
+DDC="ddcutil --sleep-multiplier 0.05"
+
+mkdir -p "$STATE_DIR"
+exec 9>"$LOCK"
+flock -n 9 || exit 0
+
+# connector -> bus, from DDC detection (skipping the slow DDC checks)
+monitor_buses() {
+  $DDC --skip-ddc-checks detect --brief 2>/dev/null | awk '
+    /I2C bus:/       { bus = $NF; sub(/^.*\/i2c-/, "", bus) }
+    /DRM connector:/ { connector = $NF; sub(/^card[0-9]+-/, "", connector)
+                       if (connector != "" && bus != "") print connector, bus; bus = "" }'
+}
+
+brightness_of() { # $1 = bus, prints "current max" or nothing
+  $DDC --bus "$1" getvcp 10 2>/dev/null |
+    sed -n 's/.*current value = *\([0-9]*\), max value = *\([0-9]*\).*/\1 \2/p' | head -1
+}
+
+set_brightness() { # $1 = bus, $2 = value
+  $DDC --bus "$1" --noverify setvcp 10 "$2" >/dev/null 2>&1
+}
+
+status() {
+  printf '%-12s %-5s %s\n' MONITOR BUS "brightness"
+  while read -r connector bus; do
+    read -r now max <<<"$(brightness_of "$bus")"
+    printf '%-12s %-5s %s\n' "$connector" "$bus" \
+      "${now:-?}${max:+/$max}"
+  done < <(monitor_buses)
+  if [[ -s $CACHE ]]; then
+    printf '\nsaved (used by `screen-power on`):\n'
+    sed 's/^/  /' "$CACHE"
+  else
+    printf '\nnothing saved yet\n'
+  fi
+}
+
+off() {
+  : >"$CACHE.tmp"
+  while read -r connector bus; do
+    read -r now max <<<"$(brightness_of "$bus")"
+    [[ -n ${now:-} ]] || continue
+    printf '%s %s %s\n' "$connector" "$bus" "$now" >>"$CACHE.tmp"
+    (( now == 0 )) || set_brightness "$bus" 0
+  done < <(monitor_buses)
+  if [[ -s $CACHE.tmp ]]; then
+    mv "$CACHE.tmp" "$CACHE"
+  else
+    rm -f "$CACHE.tmp"
+  fi
+  # A display whose backlight cannot be reached still goes dark at 0% gamma.
+  omarchy-brightness-keyboard off >/dev/null 2>&1 || true
+}
+
+on() {
+  [[ -s $CACHE ]] && while read -r connector bus value; do
+    set_brightness "$bus" "$value"
+  done <"$CACHE"
+  omarchy-brightness-keyboard restore >/dev/null 2>&1 || true
+}
+
+case "${1:-}" in
+  off) off ;;
+  on|restore) on ;;
+  status) status ;;
+  -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "usage: screen-power off|on|status" >&2; exit 1 ;;
+esac

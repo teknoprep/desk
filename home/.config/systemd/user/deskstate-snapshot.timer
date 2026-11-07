@@ -1,0 +1,11 @@
+[Unit]
+Description=Snapshot the desktop every minute (deskstate)
+
+[Timer]
+OnStartupSec=30
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=deskstate-snapshot.service
+
+[Install]
+WantedBy=timers.target

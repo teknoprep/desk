@@ -1,0 +1,27 @@
+#!/bin/bash
+# Rebuild the desktop deskstate recorded before the previous shutdown, then let
+# it settle and correct anything the compositor put on the wrong workspace.
+# Output goes to ~/.local/state/deskstate/restore-last.log for inspection.
+LATEST="$HOME/.local/state/deskstate/latest.json"
+LOG="$HOME/.local/state/deskstate/restore-last.log"
+
+[[ -f $LATEST ]] || exit 0
+# nothing to restore if the snapshot is more than a week old
+if [[ $(find "$LATEST" -mtime +7 2>/dev/null) ]]; then exit 0; fi
+
+# Omarchy renumbers workspace blocks as the outputs come up, so a window can
+# land one workspace over minutes after the restore. Two passes: one once the
+# apps have mapped, one after the compositor has finished settling.
+sleep 6
+{
+  echo "=== deskstate post-boot restore $(date -Is) ==="
+  "$HOME/.local/bin/deskstate" restore 2>&1
+  echo "=== done, exit $? ==="
+} >> "$LOG" 2>&1
+
+sleep 45
+{
+  echo "=== deskstate reconcile $(date -Is) ==="
+  "$HOME/.local/bin/deskstate" reconcile --apply 2>&1
+  echo "=== done, exit $? ==="
+} >> "$LOG" 2>&1

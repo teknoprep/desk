@@ -1,0 +1,8 @@
+[Unit]
+Description=deskstate desktop snapshot
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/deskstate snapshot --quiet
+Nice=10
+IOSchedulingClass=idle

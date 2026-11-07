@@ -1,0 +1,18 @@
+{
+  "autoVocabCaptureEnabled": false,
+  "cancelRecordingShortcut": "Escape",
+  "launchAtLogin": true,
+  "linux": {
+    "asrBackend": "auto",
+    "cleanupGpuLayers": 99,
+    "languageModelID": "sl-1",
+    "mousePushToTalkShortcut": "",
+    "vocabularyBackend": "auto",
+    "voiceModelID": "sv-1"
+  },
+  "p2t": false,
+  "pushToTalkShortcut": "",
+  "toggleRecordingShortcut": "Ctrl+Alt+Space",
+  "tone": "semi-formal",
+  "useDefaultInputDevice": true
+}

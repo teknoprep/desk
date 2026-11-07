@@ -1,0 +1,15 @@
+[Unit]
+Description=deskstate reconcile watcher (corrects workspace drift)
+# Needs a live compositor; starts with the graphical session and goes away with it.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/deskstate watch
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

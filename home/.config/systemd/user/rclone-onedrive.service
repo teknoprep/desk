@@ -1,0 +1,26 @@
+[Unit]
+Description=OneDrive (rclone FUSE mount, on-demand)
+Documentation=https://rclone.org/commands/rclone_mount/
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c '/usr/bin/fusermount3 -uz %h/OneDrive 2>/dev/null || true'
+ExecStart=/usr/bin/rclone mount onedrive: %h/OneDrive \
+    --config %h/.config/rclone/rclone.conf \
+    --vfs-cache-mode full \
+    --vfs-cache-max-size 20G \
+    --vfs-cache-max-age 72h \
+    --vfs-write-back 5s \
+    --dir-cache-time 1h \
+    --poll-interval 30s \
+    --attr-timeout 10s \
+    --drive-chunk-size 64M \
+    --umask 022 \
+    --log-level INFO
+ExecStop=/bin/sh -c '/usr/bin/fusermount3 -uz %h/OneDrive 2>/dev/null || true'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

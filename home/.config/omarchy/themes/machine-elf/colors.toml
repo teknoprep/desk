@@ -1,0 +1,42 @@
+# Machine Elf — a phosphor hacker terminal with a DMT hyperspace bleeding through it.
+# Void-black terminal greens, iridescent hyperspace accents: acid phosphor, cyan,
+# ultraviolet, hot magenta and gold. Dark mode only.
+mode = "dark"
+
+# Signature colour: acid phosphor green. Everything that says "look at me" uses it.
+accent = "#00ffa3"
+
+selection = "#123b36"
+muted = "#1b3038"
+
+background = "#05080c"
+dark_background = "#03060a"
+darker_background = "#010204"
+lighter_background = "#0a1118"
+
+foreground = "#b6f7dc"
+dark_foreground = "#3f6b60"
+light_foreground = "#a5e8cd"
+bright_foreground = "#e6fff5"
+
+# ANSI: greens are the CRT phosphor, the rest are the hyperspace spectrum.
+red = "#ff3860"
+orange = "#ff8a3d"
+yellow = "#ffd23f"
+green = "#00e08a"
+cyan = "#2ee6ff"
+blue = "#7a5cff"
+magenta = "#d94dff"
+brown = "#8a6b2f"
+
+bright_red = "#ff6b8a"
+bright_yellow = "#ffe97a"
+bright_green = "#4dffb8"
+bright_cyan = "#8ef7ff"
+bright_blue = "#a98cff"
+bright_magenta = "#ff6be8"
+
+# The signature move: a window border that is a phosphor-green to hot-magenta
+# gradient, like an interference pattern across the edge of a window.
+hyprland_active_border = "rgba(00ffa3ee) rgba(ff2fd6ee) 45deg"
+hyprland_inactive_border = "rgba(1f4a42cc)"
